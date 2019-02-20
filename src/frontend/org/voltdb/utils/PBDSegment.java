@@ -33,7 +33,6 @@ import org.voltcore.utils.DeferredSerialization;
 import org.voltdb.export.ExportSequenceNumberTracker;
 
 public abstract class PBDSegment {
-
     private static final String TRUNCATOR_CURSOR = "__truncator__";
     private static final String SCANNER_CURSOR = "__scanner__";
     protected static final String IS_FINAL_ATTRIBUTE = "VoltDB.PBDSegment.isFinal";
@@ -240,7 +239,9 @@ public abstract class PBDSegment {
      * @throws IOException
      */
     ExportSequenceNumberTracker scan(BinaryDeque.BinaryDequeScanner scanner) throws IOException {
-        if (!m_closed) throw new IOException(("Segment should not be open before truncation"));
+        if (!m_closed) {
+            throw new IOException(("Segment should not be open before truncation"));
+        }
 
         PBDSegmentReader reader = openForRead(SCANNER_CURSOR);
         ExportSequenceNumberTracker tracker = new ExportSequenceNumberTracker();

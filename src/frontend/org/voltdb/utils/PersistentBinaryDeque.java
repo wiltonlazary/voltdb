@@ -87,7 +87,7 @@ public class PersistentBinaryDeque implements BinaryDeque {
         private final int m_numObjectsDeleted;
         private int m_numRead;
 
-        public ReadCursor(String cursorId, int numObjectsDeleted) throws IOException {
+        public ReadCursor(String cursorId, int numObjectsDeleted) {
             m_cursorId = cursorId;
             m_numObjectsDeleted = numObjectsDeleted;
         }
