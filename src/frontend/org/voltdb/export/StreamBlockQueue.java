@@ -141,7 +141,6 @@ public class StreamBlockQueue {
             long committedSeqNo = cont.b().getLong(StreamBlock.COMMIT_SEQUENCE_NUMBER_OFFSET);
             int tupleCount = cont.b().getInt(StreamBlock.ROW_NUMBER_OFFSET);
             long uniqueId = cont.b().getLong(StreamBlock.UNIQUE_ID_OFFSET);
-
             //Pass the stream block a subset of the bytes, provide
             //a container that discards the original returned by the persistent deque
             StreamBlock block = new StreamBlock( fcont,
