@@ -27,6 +27,7 @@ import org.voltcore.utils.DBBPool.BBContainer;
 import org.voltcore.utils.DeferredSerialization;
 import org.voltdb.VoltDB;
 import org.voltdb.export.ExportDataSource.StreamTableSchemaSerializer;
+import org.voltdb.iv2.UniqueIdGenerator;
 import org.voltdb.utils.BinaryDeque;
 import org.voltdb.utils.BinaryDeque.BinaryDequeScanner;
 import org.voltdb.utils.BinaryDeque.BinaryDequeTruncator;
@@ -343,7 +344,8 @@ public class StreamBlockQueue {
                     if (lastSequenceNumber <= truncationSeqNo) {
                         return null;
                     }
-                    b.getLong(); // uniqueId
+                    long uniqueId = b.getLong(); // uniqueId
+                    String uniqueIdString = UniqueIdGenerator.toString(uniqueId);
 
                     // Partial truncation
                     int offset = 0;

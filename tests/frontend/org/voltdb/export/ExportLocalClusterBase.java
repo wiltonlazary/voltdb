@@ -45,7 +45,7 @@ import org.voltdb.regressionsuites.LocalCluster;
  * So far it only supports socket exporter client, a future work can be done to support other types of
  * export client.
  */
-public class TestExportLocalClusterBase extends JUnit4LocalClusterTest {
+public class ExportLocalClusterBase extends JUnit4LocalClusterTest {
     // Verifier needs to be instantiated at subclass
     protected ExportTestExpectedData m_verifier = null;
     // needs to assign different port number per export table
@@ -53,7 +53,7 @@ public class TestExportLocalClusterBase extends JUnit4LocalClusterTest {
     protected Map<String, ServerListener> m_serverSockets = new HashMap<String, ServerListener>();
     private int m_portCount = 5001;
 
-    public TestExportLocalClusterBase() {}
+    public ExportLocalClusterBase() {}
 
     private Integer getNextPort() {
         return m_portCount++;
