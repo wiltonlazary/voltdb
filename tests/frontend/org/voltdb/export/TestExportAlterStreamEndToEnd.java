@@ -23,6 +23,7 @@
 
 package org.voltdb.export;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 import java.io.File;
@@ -36,12 +37,13 @@ import org.junit.Before;
 import org.junit.Test;
 import org.voltdb.BackendTarget;
 import org.voltdb.client.Client;
+import org.voltdb.client.ClientResponse;
 import org.voltdb.compiler.VoltProjectBuilder;
 import org.voltdb.export.TestExportBaseSocketExport.ServerListener;
 import org.voltdb.regressionsuites.LocalCluster;
 import org.voltdb.utils.VoltFile;
 
-public class TestExportAlterStream extends TestExportLocalClusterBase
+public class TestExportAlterStreamEndToEnd extends TestExportLocalClusterBase
 {
     private LocalCluster m_cluster;
 
@@ -88,7 +90,7 @@ public class TestExportAlterStream extends TestExportLocalClusterBase
 
         m_cluster = new LocalCluster("testFlushExportBuffer.jar", 3, 2, KFACTOR, BackendTarget.NATIVE_EE_JNI);
         m_cluster.setNewCli(true);
-        m_cluster.setHasLocalServer(true);
+        m_cluster.setHasLocalServer(false);
         m_cluster.overrideAnyRequestForValgrind();
         // Config custom socket exporter
         boolean success = m_cluster.compile(builder);
@@ -113,11 +115,11 @@ public class TestExportAlterStream extends TestExportLocalClusterBase
     }
 
     @Test
-    public void testAlterStreamAddColumn() throws Exception {
+    public void testAlterStreamAddDropColumn() throws Exception {
         Client client = getClient(m_cluster);
 
+        //add data to stream table
         for (int i = 0; i < 100; i++) {
-            //add data to stream table
             Object[] data = new Object[3];
             data[0] = 1;
             data[1] = i;
@@ -125,6 +127,105 @@ public class TestExportAlterStream extends TestExportLocalClusterBase
             m_verifier.addRow(client, "t", i, data);
             client.callProcedure("@AdHoc", "insert into t values(" + i + ", 1)");
         }
+
+        // alter stream to add column
+        ClientResponse response = client.callProcedure("@AdHoc", "ALTER STREAM t ADD COLUMN new_column int BEFORE b");
+        assertEquals(ClientResponse.SUCCESS, response.getStatus());
+        for (int i = 100; i < 200; i++) {
+            Object[] data = new Object[4];
+            data[0] = 1;
+            data[1] = i;
+            data[2] = i;
+            data[3] = 1;
+            m_verifier.addRow(client, "t", i, data);
+            client.callProcedure("@AdHoc", "insert into t values(" + i + "," + i + ",1)");
+        }
+
+        // drop column
+        response = client.callProcedure("@AdHoc", "ALTER STREAM t DROP COLUMN new_column");
+        assertEquals(ClientResponse.SUCCESS, response.getStatus());
+        for (int i = 200; i < 300; i++) {
+            Object[] data = new Object[3];
+            data[0] = 1;
+            data[1] = i;
+            data[2] = 1;
+            m_verifier.addRow(client, "t", i, data);
+            client.callProcedure("@AdHoc", "insert into t values(" + i + ", 1)");
+        }
+
+        client.drain();
+        TestExportBaseSocketExport.waitForStreamedTargetAllocatedMemoryZero(client);
+        m_verifier.verifyRows();
+    }
+
+    @Test
+    public void testAlterStreamAlterColumn() throws Exception {
+        Client client = getClient(m_cluster);
+
+        //add data to stream table
+        for (int i = 0; i < 100; i++) {
+            Object[] data = new Object[3];
+            data[0] = 1;
+            data[1] = i;
+            data[2] = 1;
+            m_verifier.addRow(client, "t", i, data);
+            client.callProcedure("@AdHoc", "insert into t values(" + i + ", 1)");
+        }
+
+        // alter stream to alter column
+        ClientResponse response = client.callProcedure("@AdHoc", "ALTER STREAM t ALTER COLUMN b varchar(32)");
+        assertEquals(ClientResponse.SUCCESS, response.getStatus());
+        for (int i = 100; i < 200; i++) {
+            Object[] data = new Object[3];
+            data[0] = 1;
+            data[1] = i;
+            data[2] = "haha";
+            m_verifier.addRow(client, "t", i, data);
+            client.callProcedure("@AdHoc", "insert into t values(" + i + ",'haha')");
+        }
+
+        client.drain();
+        TestExportBaseSocketExport.waitForStreamedTargetAllocatedMemoryZero(client);
+        m_verifier.verifyRows();
+    }
+
+    @Test
+    public void testAlterStreamChangeModifers() throws Exception {
+        Client client = getClient(m_cluster);
+
+        //add data to stream table
+        for (int i = 0; i < 100; i++) {
+            Object[] data = new Object[3];
+            data[0] = 1;
+            data[1] = i;
+            data[2] = 1;
+            m_verifier.addRow(client, "t", i, data);
+            client.callProcedure("@AdHoc", "insert into t values(" + i + ", 1)");
+        }
+
+        // alter stream to make column b nullable
+        ClientResponse response = client.callProcedure("@AdHoc", "ALTER STREAM t ALTER COLUMN b SET NULL");
+        assertEquals(ClientResponse.SUCCESS, response.getStatus());
+        for (int i = 100; i < 200; i++) {
+            Object[] data = new Object[3];
+            data[0] = 1;
+            data[1] = i;
+            data[2] = null; // explicitly passing nulls
+            m_verifier.addRow(client, "t", i, data);
+            client.callProcedure("@AdHoc", "insert into t values(" + i + ",null)");
+        }
+
+//        // alter stream to give column b a default value
+//        response = client.callProcedure("@AdHoc", "ALTER STREAM t ALTER COLUMN b SET DEFAULT 100");
+//        assertEquals(ClientResponse.SUCCESS, response.getStatus());
+//        for (int i = 200; i < 300; i++) {
+//            Object[] data = new Object[3];
+//            data[0] = 1;
+//            data[1] = i;
+//            data[2] = 100; // default value
+//            m_verifier.addRow(client, "t", i, data);
+//            client.callProcedure("@AdHoc", "insert into t values(" + i + ")");  -- sql complains row column count mismatch
+//        }
 
         client.drain();
         TestExportBaseSocketExport.waitForStreamedTargetAllocatedMemoryZero(client);

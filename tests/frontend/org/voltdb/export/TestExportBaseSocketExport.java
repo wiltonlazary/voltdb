@@ -173,11 +173,6 @@ public class TestExportBaseSocketExport extends RegressionSuite {
                                 continue;
                             }
                             Long i = Long.parseLong(parts[ExportDecoderBase.INTERNAL_FIELD_COUNT]);
-                            StringBuilder sb = new StringBuilder();
-                            for (String part : parts) {
-                                sb.append(part).append(" ");
-                            }
-                            System.out.println("SocketExporter received:" + sb.toString());
                             if (m_seenIds.putIfAbsent(i, new AtomicLong(1)) != null) {
                                 m_seenIds.get(i).incrementAndGet();
                                 if (!Arrays.equals(m_data.get(i), parts)) {
