@@ -215,17 +215,17 @@ public class TestExportAlterStreamEndToEnd extends TestExportLocalClusterBase
             client.callProcedure("@AdHoc", "insert into t values(" + i + ",null)");
         }
 
-//        // alter stream to give column b a default value
-//        response = client.callProcedure("@AdHoc", "ALTER STREAM t ALTER COLUMN b SET DEFAULT 100");
-//        assertEquals(ClientResponse.SUCCESS, response.getStatus());
-//        for (int i = 200; i < 300; i++) {
-//            Object[] data = new Object[3];
-//            data[0] = 1;
-//            data[1] = i;
-//            data[2] = 100; // default value
-//            m_verifier.addRow(client, "t", i, data);
-//            client.callProcedure("@AdHoc", "insert into t values(" + i + ")");  -- sql complains row column count mismatch
-//        }
+        // alter stream to give column b a default value
+        response = client.callProcedure("@AdHoc", "ALTER STREAM t ALTER COLUMN b SET DEFAULT 100");
+        assertEquals(ClientResponse.SUCCESS, response.getStatus());
+        for (int i = 200; i < 300; i++) {
+            Object[] data = new Object[3];
+            data[0] = 1;
+            data[1] = i;
+            data[2] = 100; // default value
+            m_verifier.addRow(client, "t", i, data);
+            client.callProcedure("@AdHoc", "insert into t (a) values(" + i + ")");
+        }
 
         client.drain();
         TestExportBaseSocketExport.waitForStreamedTargetAllocatedMemoryZero(client);
