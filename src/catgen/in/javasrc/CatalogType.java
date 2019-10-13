@@ -37,8 +37,8 @@ public abstract class CatalogType implements Comparable<CatalogType> {
 
     class CatalogReference<T extends CatalogType> {
 
-        T m_value = null;
-        String m_unresolvedPath = null;
+        volatile T m_value = null;
+        volatile String m_unresolvedPath = null;
         Object m_lock = new Object();
 
         public void setUnresolved(String path) {
@@ -243,7 +243,7 @@ public abstract class CatalogType implements Comparable<CatalogType> {
         return getCatalogPath().compareTo(o.getCatalogPath());
     }
 
-    abstract void copyFields(CatalogType obj);
+    abstract public void copyFields(CatalogType obj);
 
     CatalogType deepCopy(Catalog catalog, CatalogMap<? extends CatalogType> parentMap) {
 

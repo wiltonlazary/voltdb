@@ -26,10 +26,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import com.google_voltpatches.common.base.Preconditions;
 import org.cliffc_voltpatches.high_scale_lib.NonBlockingHashMap;
 import org.voltcore.logging.VoltLogger;
+import org.voltcore.utils.VoltUnsafe;
 import sun.nio.ch.DirectBuffer;
-import java.lang.invoke.MethodHandle;
-import java.lang.invoke.MethodHandles;
-import java.lang.reflect.Method;
 
 #ifndef NO_MEMCHECK
 import java.util.List;
@@ -168,14 +166,14 @@ public final class DBBPool {
 
         public final void tag(final String tag) {
 #ifndef NO_MEMCHECK
-            StringBuilder sb = new StringBuilder(1024);
-            sb.append("<<TAG:").append(m_tags.size()).append(">> ");
-            sb.append(tag).append("\n");
-            sb.append(CoreUtils.throwableToString(new Throwable()));
             synchronized(this) {
                 if (m_tags == null) {
                     m_tags = new ArrayList<String>();
                 }
+                StringBuilder sb = new StringBuilder(1024);
+                sb.append("<<TAG:").append(m_tags.size()).append(">> ");
+                sb.append(tag).append("\n");
+                sb.append(CoreUtils.throwableToString(new Throwable()));
                 m_tags.add(sb.toString());
             }
 #endif
@@ -211,6 +209,10 @@ public final class DBBPool {
             }
         }
 #endif
+        @Override
+        public String toString() {
+            return getClass().getSimpleName() + ": " + b;
+        }
     }
 
     /**
@@ -237,6 +239,40 @@ public final class DBBPool {
         public final void discard() {
             final ByteBuffer buf = checkDoubleFree();
             DBBPool.cleanByteBuffer(buf);
+        }
+    }
+
+    /**
+     * Wrapper for native allocated direct memory
+     *
+     */
+    public static final class NDBBWrapperContainer extends BBContainer {
+        private NDBBWrapperContainer(ByteBuffer b) {
+            super( b );
+        }
+
+        @Override
+        public final void discard() {
+            final ByteBuffer buf = checkDoubleFree();
+            if (buf == null || !buf.isDirect()) {
+               return;
+            }
+            final DirectBuffer dbuf = (DirectBuffer) buf;
+            deleteCharArrayMemory(dbuf.address());
+        }
+    }
+
+    public static class DBBDelegateContainer extends BBContainer {
+        protected final BBContainer m_delegate;
+        
+        protected DBBDelegateContainer(BBContainer delegate) {
+            super(delegate.b());
+            m_delegate = delegate;
+        }
+
+        @Override
+        public void discard() {
+            m_delegate.discard();
         }
     }
 
@@ -547,7 +583,7 @@ public final class DBBPool {
     private static native void nativeDeleteCharArrayMemory(long pointer);
 
     public static BBContainer allocateUnsafeByteBuffer(long size) {
-        final BBContainer retcont = DBBPool.wrapBB(nativeAllocateUnsafeByteBuffer(size));
+        final BBContainer retcont = new NDBBWrapperContainer(nativeAllocateUnsafeByteBuffer(size));
 #ifdef MEMCHECK_FULL
         final long pointer = retcont.address();
         m_allocatedStuff.put(pointer, new Throwable("Thread \"" + Thread.currentThread().getName() + "\" allocated " + Long.toHexString(pointer) + " here at " + System.currentTimeMillis()));
@@ -569,8 +605,9 @@ public final class DBBPool {
      * called deleteCharArrayMemory on the address
      */
     private static void cleanByteBuffer(ByteBuffer buf) {
-        if (buf == null) return;
-        if (!buf.isDirect()) return;
+        if (buf == null || !buf.isDirect()) {
+            return;
+        }
         final DirectBuffer dbuf = (DirectBuffer) buf;
         if (!VoltUnsafe.cleanDirectBuffer(buf)) {
             deleteCharArrayMemory(dbuf.address());

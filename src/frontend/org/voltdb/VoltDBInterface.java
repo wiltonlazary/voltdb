@@ -28,11 +28,13 @@ import org.voltdb.compiler.deploymentfile.DeploymentType;
 import org.voltdb.compiler.deploymentfile.PathsType;
 import org.voltdb.compiler.deploymentfile.PathsType.Largequeryswap;
 import org.voltdb.dtxn.SiteTracker;
+import org.voltdb.elastic.ElasticService;
 import org.voltdb.iv2.Cartographer;
 import org.voltdb.iv2.SpScheduler.DurableUniqueIdListener;
 import org.voltdb.licensetool.LicenseApi;
 import org.voltdb.settings.ClusterSettings;
 import org.voltdb.snmp.SnmpTrapSender;
+import org.voltdb.task.TaskManager;
 import org.voltdb.utils.HTTPAdminListener;
 
 import com.google_voltpatches.common.util.concurrent.ListenableFuture;
@@ -72,6 +74,8 @@ public interface VoltDBInterface
     public String getLargeQuerySwapPath();
 
     public boolean isBare();
+    public boolean isClusterComplete();
+
     /**
      * Initialize all the global components, then initialize all the m_sites.
      * @param config Configuration from command line.
@@ -342,4 +346,16 @@ public interface VoltDBInterface
      * @return true if current node is joining and haven't finished the snapshot
      */
     public boolean isJoining();
+
+    public ElasticService getElasticService();
+
+    /**
+     * @return The instance of {@link TaskManager} which is running in this instance
+     */
+    public TaskManager getTaskManager();
+
+    /**
+     * notify surviving node upon shutting itself down
+     */
+    public void notifyOfShutdown();
 }

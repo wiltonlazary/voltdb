@@ -24,12 +24,15 @@ import java.util.Iterator;
 
 import org.voltcore.logging.VoltLogger;
 import org.voltcore.utils.DBBPool.BBContainer;
-import org.voltcore.utils.DeferredSerialization;
+import org.voltdb.CatalogContext;
 import org.voltdb.VoltDB;
-import org.voltdb.export.ExportDataSource.StreamTableSchemaSerializer;
+import org.voltdb.catalog.Table;
+import org.voltdb.exportclient.ExportRowSchema;
+import org.voltdb.exportclient.ExportRowSchemaSerializer;
 import org.voltdb.utils.BinaryDeque;
 import org.voltdb.utils.BinaryDeque.BinaryDequeScanner;
 import org.voltdb.utils.BinaryDeque.BinaryDequeTruncator;
+import org.voltdb.utils.BinaryDeque.BinaryDequeValidator;
 import org.voltdb.utils.BinaryDeque.TruncatorResponse;
 import org.voltdb.utils.BinaryDequeReader;
 import org.voltdb.utils.PersistentBinaryDeque;
@@ -45,19 +48,26 @@ import org.voltdb.utils.VoltFile;
  *
  * Export PBD buffer layout:
  *    -- Segment Header ---
- *    crc(8) + numberOfEntries(4) + totalBytes(4)
- *    -- Export Segment Header ---
+ *    (defined in PBDSegment.java, see comments for segment header layout)
+ *
+ *    -- Export Extra Segment Header ---
  *    exportVersion(1) + generationId(8) + schemaLen(4) + tupleSchema(var length) +
- *    tableNameLength(4) + tableName(var length) + colNameLength(4) + colName(var length) + colType(1) + colLength(4) + ...
+ *    tableNameLength(4) + tableName(var length) + colNameLength(4) + colName(var length) +
+ *    colType(1) + colLength(4) + ...
+ *
  *    --- Common Entry Header   ---
- *    crc(8) + length(4) + flags(4)
+ *   (defined in PBDSegment.java, see comments for entry header layout)
+ *
  *    --- Export Entry Header   ---
- *    seqNo(8) + tupleCount(4) + uniqueId(8)
+ *    seqNo(8) + committedSeqNo(8) + tupleCount(4) + uniqueId(8)
+ *
  *    --- Row Header      ---
  *    rowLength(4) + partitionColumnIndex(4) + columnCount(4, includes metadata columns) +
  *    nullArrayLength(4) + nullArray(var length)
+ *
  *    --- Metadata        ---
  *    TxnId(8) + timestamp(8) + seqNo(8) + partitionId(8) + siteId(8) + exportOperation(1)
+ *
  *    --- Row Data        ---
  *    rowData(var length)
  *
@@ -66,7 +76,6 @@ import org.voltdb.utils.VoltFile;
 public class StreamBlockQueue {
 
     private static final VoltLogger exportLog = new VoltLogger("EXPORT");
-    public static final int EXPORT_BUFFER_VERSION = 1;
 
     public static final String EXPORT_DISABLE_COMPRESSION_OPTION = "EXPORT_DISABLE_COMPRESSION";
     private static final boolean DISABLE_COMPRESSION = Boolean.getBoolean(EXPORT_DISABLE_COMPRESSION_OPTION);
@@ -80,24 +89,36 @@ public class StreamBlockQueue {
     /**
      * A deque for persisting data to disk both for persistence and as a means of overflowing storage
      */
-    private BinaryDeque m_persistentDeque;
+    private BinaryDeque<ExportRowSchema> m_persistentDeque;
 
     private final String m_nonce;
     private final String m_path;
+    private final int m_partitionId;
     private final String m_streamName;
-    private BinaryDequeReader m_reader;
+    // The initial generation id of the stream that SBQ currently represents.
+    private long m_initialGenerationId;
+    private BinaryDequeReader<ExportRowSchema> m_reader;
 
-    public StreamBlockQueue(String path, String nonce, String streamName)
+    public StreamBlockQueue(String path, String nonce, String streamName, int partitionId, long genId)
             throws java.io.IOException {
-        m_streamName = streamName;
-        StreamTableSchemaSerializer ds = new StreamTableSchemaSerializer(
-                VoltDB.instance().getCatalogContext(), m_streamName);
-        m_persistentDeque = new PersistentBinaryDeque( nonce, ds, new VoltFile(path), exportLog);
+        // Not a creation by default
+        this(path, nonce, streamName, partitionId, genId, false);
+    }
+
+    public StreamBlockQueue(String path, String nonce, String streamName, int partitionId, long genId, boolean create)
+            throws java.io.IOException {
         m_path = path;
         m_nonce = nonce;
-        m_reader = m_persistentDeque.openForRead(m_nonce);
+        m_streamName = streamName;
+        m_partitionId = partitionId;
+        m_initialGenerationId = genId;
+
+        // When creating, delete any existing PBD files
+        constructPBD(genId, create);
         if (exportLog.isDebugEnabled()) {
-            exportLog.debug(m_nonce + " At SBQ creation, PBD size is " + (m_reader.sizeInBytes() - (8 * m_reader.getNumObjects())));
+            exportLog.debug(m_nonce + " At SBQ creation, PBD size is " +
+                    (m_reader.sizeInBytes() - (8 * m_reader.getNumObjects())) +
+                    " initial generation ID is " + m_initialGenerationId);
         }
     }
 
@@ -111,76 +132,48 @@ public class StreamBlockQueue {
     /**
      * Wrapper around the common operation of pulling an element out of the persistent deque.
      * The behavior is complicated (and might change) since the persistent deque can throw an IOException.
-     * The poll always removes the element from the persistent queue
-     * (although not necessarily removing the file backing, that happens at deleteContents) and will add
-     * a reference to the block to the in memory deque unless actuallyPoll is true.
-     * @param actuallyPoll
-     * @return
+     * The poll always removes the element from the persistent queue (although not necessarily removing the
+     * file backing, that happens at deleteContents) and will add a reference to the block to the in memory
+     * deque unless actuallyPoll is true, in which case the polled block ownership is transferred to the caller.
+     *
+     * @param actuallyPoll true if this is an actual poll transferring the block to the caller
+     * @return the polled block
      */
     private StreamBlock pollPersistentDeque(boolean actuallyPoll) {
-        BBContainer cont = null;
-        BBContainer schemaCont = null;
+
+        BinaryDequeReader.Entry<ExportRowSchema> entry = null;
+        StreamBlock block = null;
         try {
-            // Start to read a new segment
-            if (m_reader.isStartOfSegment()) {
-                schemaCont = m_reader.getExtraHeader(-1);
-            }
-            cont = m_reader.poll(PersistentBinaryDeque.UNSAFE_CONTAINER_FACTORY, false);
-        } catch (IOException e) {
-            exportLog.error("Failed to poll from persistent binary deque:" + e);
-        }
+            entry = m_reader.pollEntry(PersistentBinaryDeque.UNSAFE_CONTAINER_FACTORY);
+            if (entry != null) {
+                ByteBuffer b = entry.getData();
+                b.order(ByteOrder.LITTLE_ENDIAN);
+                long seqNo = b.getLong(StreamBlock.SEQUENCE_NUMBER_OFFSET);
+                long committedSeqNo = b.getLong(StreamBlock.COMMIT_SEQUENCE_NUMBER_OFFSET);
+                int tupleCount = b.getInt(StreamBlock.ROW_NUMBER_OFFSET);
+                long uniqueId = b.getLong(StreamBlock.UNIQUE_ID_OFFSET);
 
-        if (cont == null) {
-            return null;
-        } else {
-            long segmentIndex = m_reader.getSegmentIndex();
-            cont.b().order(ByteOrder.LITTLE_ENDIAN);
-            //If the container is not null, unpack it.
-            final BBContainer fcont = cont;
-            long seqNo = cont.b().getLong(StreamBlock.SEQUENCE_NUMBER_OFFSET);
-            int tupleCount = cont.b().getInt(StreamBlock.ROW_NUMBER_OFFSET);
-            long uniqueId = cont.b().getLong(StreamBlock.UNIQUE_ID_OFFSET);
-            //Pass the stream block a subset of the bytes, provide
-            //a container that discards the original returned by the persistent deque
-            StreamBlock block = new StreamBlock( fcont,
-                schemaCont,
-                seqNo,
-                tupleCount,
-                uniqueId,
-                segmentIndex,
-                true);
+                block = new StreamBlock(entry,
+                        seqNo,
+                        committedSeqNo,
+                        tupleCount,
+                        uniqueId,
+                        true);
 
-            //Optionally store a reference to the block in the in memory deque
-            if (!actuallyPoll) {
-                m_memoryDeque.offer(block);
+                // Optionally store a reference to the block in the in memory deque
+                // Note that any in-memory block must have a schema
+                if (!actuallyPoll) {
+                    assert(entry.getExtraHeader() != null);
+                    m_memoryDeque.offer(block);
+                }
             }
-            return block;
         }
+        catch (Exception e) {
+            exportLog.error("Failed to poll from persistent binary deque", e);
+        }
+        return block;
     }
 
-    /*
-     * Poll stream table schema that either represents the first object in the memory dequeue, or
-     * from the segment that the cursor is currently reading on.
-     */
-    public BBContainer pollSchema() {
-        BBContainer schemaCont = null;
-        long segmentIndex = -1;
-        if (m_memoryDeque.peek() != null) {
-            StreamBlock sb = m_memoryDeque.peek();
-            BBContainer cont = sb.getSchemaContainer();
-            if (cont != null) {
-                return cont;
-            }
-            segmentIndex = sb.getSegmentIndex();
-        }
-        try {
-            schemaCont = m_reader.getExtraHeader(segmentIndex);
-        } catch (IOException e) {
-            exportLog.error("Failed to poll schema: " + e);
-        }
-        return schemaCont;
-
-    }
     /*
      * Present an iterator that is backed by the blocks
      * that are already loaded as well as blocks that
@@ -264,15 +257,15 @@ public class StreamBlockQueue {
         }
     }
 
-    public void updateSchema(DeferredSerialization schemaSerializer) throws IOException {
-        m_persistentDeque.updateExtraHeader(schemaSerializer);
+    public void updateSchema(ExportRowSchema schema) throws IOException {
+        m_persistentDeque.updateExtraHeader(schema);
     }
 
     /*
      * Only allow two blocks in memory, put the rest in the persistent deque
      */
     public void offer(StreamBlock streamBlock) throws IOException {
-        m_persistentDeque.offer(streamBlock.asBBContainer(), !DISABLE_COMPRESSION);
+        m_persistentDeque.offer(streamBlock.asBBContainer());
         long unreleasedSeqNo = streamBlock.unreleasedSequenceNumber();
         if (m_memoryDeque.size() < 2) {
             StreamBlock fromPBD = pollPersistentDeque(false);
@@ -283,13 +276,8 @@ public class StreamBlockQueue {
         }
     }
 
-    /*
-     * This is a no-op now with nofsync=true
-     */
-    public void sync(boolean nofsync) throws IOException {
-        if (!nofsync) {
-            m_persistentDeque.sync();
-        }
+    public void sync() throws IOException {
+        m_persistentDeque.sync();
     }
 
     // Only used in tests, should be removed.
@@ -306,7 +294,7 @@ public class StreamBlockQueue {
     }
 
     public void close() throws IOException {
-        sync(true);
+        sync();
         m_persistentDeque.close();
         for (StreamBlock sb : m_memoryDeque) {
             sb.discard();
@@ -337,6 +325,7 @@ public class StreamBlockQueue {
                     if (startSequenceNumber > truncationSeqNo) {
                         return PersistentBinaryDeque.fullTruncateResponse();
                     }
+                    final long committedSequenceNumber = b.getLong(); // committedSequenceNumber
                     final int tupleCountPos = b.position();
                     final int tupleCount = b.getInt();
                     // There is nothing to do with this buffer
@@ -372,35 +361,81 @@ public class StreamBlockQueue {
                 }
             }
         });
-
         // close reopen reader
         m_persistentDeque.close();
-        StreamTableSchemaSerializer ds = new StreamTableSchemaSerializer(
-                VoltDB.instance().getCatalogContext(), m_streamName);
-        m_persistentDeque = new PersistentBinaryDeque(m_nonce, ds, new VoltFile(m_path), exportLog);
-        m_reader = m_persistentDeque.openForRead(m_nonce);
+        CatalogContext catalogContext = VoltDB.instance().getCatalogContext();
+        constructPBD(catalogContext.m_genId, false);
         // temporary debug stmt
         exportLog.info("After truncate, PBD size is " + (m_reader.sizeInBytes() - (8 * m_reader.getNumObjects())));
     }
 
     public ExportSequenceNumberTracker scanForGap() throws IOException {
-        assert(m_memoryDeque.isEmpty());
-        return m_persistentDeque.scanForGap(new BinaryDequeScanner() {
-
+        ExportSequenceNumberTracker tracker = new ExportSequenceNumberTracker();
+        m_persistentDeque.scanEntries(new BinaryDequeScanner() {
             @Override
-            public ExportSequenceNumberTracker scan(BBContainer bbc) {
+            public void scan(BBContainer bbc) {
                 ByteBuffer b = bbc.b();
                 ByteOrder endianness = b.order();
                 b.order(ByteOrder.LITTLE_ENDIAN);
                 final long startSequenceNumber = b.getLong();
+                final long committedSequenceNumber = b.getLong();
                 final int tupleCount = b.getInt();
                 b.order(endianness);
-                ExportSequenceNumberTracker gapTracker = new ExportSequenceNumberTracker();
-                gapTracker.append(startSequenceNumber, startSequenceNumber + tupleCount - 1);
-                return gapTracker;
+                tracker.addRange(startSequenceNumber, startSequenceNumber + tupleCount - 1);
             }
 
         });
+        return tracker;
+    }
+
+    public boolean deleteStaleBlocks(long generationId) throws IOException {
+        boolean didCleanup = m_persistentDeque.deletePBDSegment(new BinaryDequeValidator<ExportRowSchema>() {
+
+            @Override
+            public boolean isStale(ExportRowSchema extraHeader) {
+                assert (extraHeader != null);
+                boolean fromOlderGeneration = extraHeader.initialGenerationId < generationId;
+                if (exportLog.isDebugEnabled() && fromOlderGeneration) {
+                    exportLog.debug("Delete PBD segments of " +
+                            (extraHeader.tableName + "_" + extraHeader.partitionId) +
+                            " from older generation " + extraHeader.initialGenerationId);
+                }
+                return fromOlderGeneration;
+            }
+
+        });
+        if (generationId != m_initialGenerationId) {
+            m_initialGenerationId = generationId;
+            if (exportLog.isDebugEnabled()) {
+                exportLog.debug("Update created generation id of " + m_nonce + " to " + generationId);
+            }
+        }
+        if (didCleanup) {
+            // Close and reopen
+            close();
+            CatalogContext catalogContext = VoltDB.instance().getCatalogContext();
+            constructPBD(catalogContext.m_genId, false);
+        }
+        return didCleanup;
+    }
+
+    public long getGenerationIdCreated() {
+        return m_initialGenerationId;
+    }
+
+    private void constructPBD(long genId, boolean deleteExisting) throws IOException {
+        Table streamTable = VoltDB.instance().getCatalogContext().database.getTables().get(m_streamName);
+
+        ExportRowSchema schema = ExportRowSchema.create(streamTable, m_partitionId, m_initialGenerationId, genId);
+        ExportRowSchemaSerializer serializer = new ExportRowSchemaSerializer();
+
+        m_persistentDeque = PersistentBinaryDeque.builder(m_nonce, new VoltFile(m_path), exportLog)
+                .initialExtraHeader(schema, serializer)
+                .compression(!DISABLE_COMPRESSION)
+                .deleteExisting(deleteExisting)
+                .build();
+
+        m_reader = m_persistentDeque.openForRead(m_nonce);
     }
 
     @Override

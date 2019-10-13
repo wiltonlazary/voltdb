@@ -23,10 +23,14 @@
 
 package org.voltdb;
 
-import java.io.File;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 
 import org.junit.Rule;
 import org.junit.Test;
@@ -36,11 +40,13 @@ import org.voltdb.client.ClientConfig;
 import org.voltdb.client.ClientConfigForTest;
 import org.voltdb.client.ClientFactory;
 import org.voltdb.compiler.VoltProjectBuilder;
+import org.voltdb.compiler.deploymentfile.ServerExportEnum;
 import org.voltdb.export.ExportDataProcessor;
+import org.voltdb.export.ExportLocalClusterBase;
 import org.voltdb.export.TestExportBase;
+import org.voltdb.export.SocketExportTestServer;
 import org.voltdb.regressionsuites.LocalCluster;
 import org.voltdb.regressionsuites.MultiConfigSuiteBuilder;
-import org.voltdb.utils.VoltFile;
 
 /**
  * Listens for connections from socket export and then counts expected rows.
@@ -50,18 +56,17 @@ public class TestExportSuiteReplicatedSocketExport extends TestExportBase {
     @Rule
     public FlakyTestRule ftRule = new FlakyTestRule();
 
-    private static ServerListener m_serverSocket;
+    private static SocketExportTestServer m_serverSocket;
     private static LocalCluster config;
+    private static List<String> exStream = new ArrayList<>(Arrays.asList("EX"));
 
     @Override
     public void setUp() throws Exception {
         m_username = "default";
         m_password = "password";
-        VoltFile.recursivelyDelete(new File("/tmp/" + System.getProperty("user.name")));
-        File f = new File("/tmp/" + System.getProperty("user.name"));
-        f.mkdirs();
+        ExportLocalClusterBase.resetDir();
         super.setUp();
-        m_serverSocket = new ServerListener(5001);
+        m_serverSocket = new SocketExportTestServer(5001);
         m_serverSocket.start();
     }
 
@@ -69,7 +74,7 @@ public class TestExportSuiteReplicatedSocketExport extends TestExportBase {
     public void tearDown() throws Exception {
         super.tearDown();
         try {
-            m_serverSocket.close();
+            m_serverSocket.shutdown();
             m_serverSocket = null;
         } catch (Exception e) {}
     }
@@ -80,7 +85,7 @@ public class TestExportSuiteReplicatedSocketExport extends TestExportBase {
         System.out.println("testExportReplicatedExportToSocket");
         final Client client = getClient();
 
-        client.callProcedure("@AdHoc", "create stream ex (i bigint not null)");
+        client.callProcedure("@AdHoc", "create stream ex export to target ex (i bigint not null)");
         StringBuilder insertSql;
         for (int i=0;i<5000;i++) {
             insertSql = new StringBuilder();
@@ -88,8 +93,8 @@ public class TestExportSuiteReplicatedSocketExport extends TestExportBase {
             client.callProcedure("@AdHoc", insertSql.toString());
         }
         client.drain();
-        waitForExportAllocatedMemoryZero(client);
-        verifyExportedTuples(5000);
+        waitForExportAllRowsDelivered(client, exStream);
+        m_serverSocket.verifyExportedTuples(5000);
 
         for (int i=5000;i<10000;i++) {
             insertSql = new StringBuilder();
@@ -97,8 +102,8 @@ public class TestExportSuiteReplicatedSocketExport extends TestExportBase {
             client.callProcedure("@AdHoc", insertSql.toString());
         }
         client.drain();
-        waitForExportAllocatedMemoryZero(client);
-        verifyExportedTuples(10000);
+        waitForExportAllRowsDelivered(client, exStream);
+        m_serverSocket.verifyExportedTuples(10000);
 
         for (int i=10000;i<15000;i++) {
             insertSql = new StringBuilder();
@@ -106,8 +111,8 @@ public class TestExportSuiteReplicatedSocketExport extends TestExportBase {
             client.callProcedure("@AdHoc", insertSql.toString());
         }
         client.drain();
-        waitForExportAllocatedMemoryZero(client);
-        verifyExportedTuples(15000);
+        waitForExportAllRowsDelivered(client, exStream);
+        m_serverSocket.verifyExportedTuples(15000);
 
         for (int i=15000;i<30000;i++) {
             insertSql = new StringBuilder();
@@ -115,8 +120,8 @@ public class TestExportSuiteReplicatedSocketExport extends TestExportBase {
             client.callProcedure("@AdHoc", insertSql.toString());
         }
         client.drain();
-        waitForExportAllocatedMemoryZero(client);
-        verifyExportedTuples(30000);
+        waitForExportAllRowsDelivered(client, exStream);
+        m_serverSocket.verifyExportedTuples(30000);
 
         for (int i=30000;i<45000;i++) {
             insertSql = new StringBuilder();
@@ -124,8 +129,8 @@ public class TestExportSuiteReplicatedSocketExport extends TestExportBase {
             client.callProcedure("@AdHoc", insertSql.toString());
         }
         client.drain();
-        waitForExportAllocatedMemoryZero(client);
-        verifyExportedTuples(45000);
+        waitForExportAllRowsDelivered(client, exStream);
+        m_serverSocket.verifyExportedTuples(45000);
     }
 
     @Test
@@ -135,15 +140,15 @@ public class TestExportSuiteReplicatedSocketExport extends TestExportBase {
         client.createConnection("localhost", config.port(0));
 
         client.callProcedure("@AdHoc", "create table regular (i bigint not null)");
-        client.callProcedure("@AdHoc", "create stream ex (i bigint not null)");
+        client.callProcedure("@AdHoc", "create stream ex export to target ex (i bigint not null)");
         StringBuilder insertSql = new StringBuilder();
         for (int i=0;i<50;i++) {
             insertSql.append("insert into ex values(" + i + ");");
         }
         client.callProcedure("@AdHoc", insertSql.toString());
         client.drain();
-        waitForExportAllocatedMemoryZero(client);
-        verifyExportedTuples(50);
+        waitForExportAllRowsDelivered(client, exStream);
+        m_serverSocket.verifyExportedTuples(50);
 
         config.killSingleHost(1);
         config.recoverOne(1, 0, "");
@@ -154,9 +159,9 @@ public class TestExportSuiteReplicatedSocketExport extends TestExportBase {
         }
         client.callProcedure("@AdHoc", insertSql.toString());
         client.drain();
-        waitForExportAllocatedMemoryZero(client);
+        waitForExportAllRowsDelivered(client, exStream);
         //After recovery make sure we get exact 2 of each.
-        verifyExportedTuples(100);
+        m_serverSocket.verifyExportedTuples(100);
 
         config.killSingleHost(2);
         config.recoverOne(2, 0, "");
@@ -167,9 +172,9 @@ public class TestExportSuiteReplicatedSocketExport extends TestExportBase {
         }
         client.callProcedure("@AdHoc", insertSql.toString());
         client.drain();
-        waitForExportAllocatedMemoryZero(client);
+        waitForExportAllRowsDelivered(client, exStream);
         //After recovery make sure we get exact 2 of each.
-        verifyExportedTuples(150);
+        m_serverSocket.verifyExportedTuples(150);
 
         //Kill host with all masters now.
         config.killSingleHost(0);
@@ -183,8 +188,8 @@ public class TestExportSuiteReplicatedSocketExport extends TestExportBase {
         }
         client.callProcedure("@AdHoc", insertSql.toString());
         client.drain();
-        waitForExportAllocatedMemoryZero(client);
-        verifyExportedTuples(2000);
+        waitForExportAllRowsDelivered(client, exStream);
+        m_serverSocket.verifyExportedTuples(2000);
     }
 
     public TestExportSuiteReplicatedSocketExport(final String name) {
@@ -207,11 +212,11 @@ public class TestExportSuiteReplicatedSocketExport extends TestExportBase {
         props.put("replicated", "true");
         props.put("skipinternals", "true");
 
-        project.addExport(true /* enabled */, "custom", props);
+        project.addExport(true, ServerExportEnum.CUSTOM, props, "ex");
         /*
          * compile the catalog all tests start with
          */
-       config = new LocalCluster("export-ddl-cluster-rep.jar", 8, 3, 2,
+        config = new LocalCluster("export-ddl-cluster-rep.jar", 8, 3, 2,
                 BackendTarget.NATIVE_EE_JNI, LocalCluster.FailureState.ALL_RUNNING, true, additionalEnv);
         config.setHasLocalServer(false);
         boolean compile = config.compile(project);

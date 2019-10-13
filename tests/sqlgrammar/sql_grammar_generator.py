@@ -423,6 +423,8 @@ def print_file_tail_and_errors(from_file, to_file, number_of_lines=50):
                                 'ClassCastException',
                                 'SAXParseException',
                                 'RuntimeException',
+                                'IllegalStateException',
+                                'JSONException',
                                 'VoltTypeException']},
                     {'type':'ERROR', 'title':"'ERROR'",
                     'subtypes':['Error compiling query',
@@ -627,11 +629,15 @@ def print_summary(error_message=''):
     global start_time, sql_output_file, sqlcmd_output_file, sqlcmd_summary_file, \
         options, echo_substrings, count_sql_statements, last_n_sql_statements, \
         hanging_sql_commands, find_in_log_output_files
+    # Used to test whether the new sql_partially_echoed_as_output code is useful
+    global count_sql_partially_echoed
 
     # Generate the summary message (to be printed below)
     summary_message = ''
+    # Used to test whether the new sql_partially_echoed_as_output code is useful
+    last_sql_message = '\ncount_sql_partially_echoed: '+str(count_sql_partially_echoed)+'\n'
     try:
-        last_sql_message = '\n\nLast ' + str(len(last_n_sql_statements)) + ' SQL statements sent to sqlcmd:\n' \
+        last_sql_message += '\n\nLast ' + str(len(last_n_sql_statements)) + ' SQL statements sent to sqlcmd:\n' \
                          + get_last_n_sql_statements(last_n_sql_statements, False, False)
         seconds = time() - start_time
         summary_message  = '\n\nSUMMARY: in ' + re.sub('^0:', '', str(timedelta(0, round(seconds))), 1) \
@@ -814,6 +820,19 @@ def formatted_time(seconds_since_epoch):
     return strftime('%Y-%m-%d %H:%M:%S', localtime(seconds_since_epoch)) + ' (' + str(seconds_since_epoch) + ')'
 
 
+def odd_num_quote_characters(sql, chars="'"):
+    """Check whether the specified string contains an odd number of any of the
+    specified characters; by default, only the single-quote character (') is
+    checked; returns True or False.
+    """
+    for ch in chars:
+        if sql.count(ch) % 2:
+            if debug > 2:
+                print "\nDEBUG: in odd_num_quote_characters, found odd number "+str(sql.count(ch))+" for char '"+str(ch)+"'."
+            return True
+    return False
+
+
 def print_sql_statement(sql, num_chars_in_sql_type=6):
     """Print the specified SQL statement (sql), to the SQL output file (which may
     be STDOUT); and, if the sqlcmd option was specified, pass that SQL statement
@@ -824,6 +843,46 @@ def print_sql_statement(sql, num_chars_in_sql_type=6):
         last_n_sql_statements, options, echo_substrings, symbol_depth, symbol_order, \
         known_error_messages, known_valid_show_responses, hanging_sql_commands, \
         find_in_log_output_files, debug
+    # Used to test whether the new sql_partially_echoed_as_output code is useful
+    global count_sql_partially_echoed
+
+    # Count the number of semicolons, which determines the number of
+    # distinct SQL statements within 'sql'; in the (somewhat unusual)
+    # case that there is more than one, split them up and handle them
+    # separately
+    sql_statement_count = sql.count(';')
+    if sql_statement_count > 1:
+        if debug > 2:
+            print "\nDEBUG: sql_statement_count:", sql_statement_count
+            if debug > 3:
+                print 'DEBUG: for sql:\n    "'+sql+'"'
+        completed_via_recursive_calls = False
+        start_index = 0
+        for i in range(sql_statement_count):
+            end_index = sql.find(';', start_index)
+            if end_index <= 0:
+                print '\nWARNING: in print_sql_statement, apparently miscounted semicolons/SQL statements:'
+                print '         sql:\n', str(sql)
+                print '         sql_statement_count:', str(sql_statement_count)
+                print '         i                  :', str(i)
+                print '         start_index        :', str(start_index)
+                print '         end_index          :', str(end_index)
+                print '         sql[start_index:]  :\n', str(sql[start_index:])
+                break
+            sql_substring = sql[start_index:end_index].strip() + ';'
+            if odd_num_quote_characters(sql_substring):
+                sql = sql[start_index:]
+                if debug > 2:
+                    print '\nDEBUG: proceeding with sql substring:\n    "'+sql+'"'
+                completed_via_recursive_calls = False
+                break
+            if debug > 2:
+                print '\nDEBUG: calling print_sql_statement with sql_substring:\n    "'+sql_substring+'"'
+            print_sql_statement(sql_substring, num_chars_in_sql_type)
+            completed_via_recursive_calls = True
+            start_index = end_index + 1
+        if completed_via_recursive_calls:
+            return
 
     # Print the specified SQL statement to the specified output file
     print >> sql_output_file, sql
@@ -850,6 +909,7 @@ def print_sql_statement(sql, num_chars_in_sql_type=6):
         # Pass the SQL statement to the sqlcmd sub-process
         sqlcmd_proc.stdin.write(sql + '\n')
         sql_was_echoed_as_output = False
+        sql_partially_echoed_as_output = False
 
         # Kludge for certain 'exec @Statistics' commands, which return multiple
         # '(Returned N rows in X.XXs)' messages
@@ -867,7 +927,7 @@ def print_sql_statement(sql, num_chars_in_sql_type=6):
         signal(SIGALRM, timeout_handler)
         max_seconds_to_wait_for_sqlcmd = 60  # must be larger than query timeout of 10
         if debug > 4:
-            print 'DEBUG: max_seconds_to_wait_for_sqlcmd: ' + str(max_seconds_to_wait_for_sqlcmd)
+            print 'DEBUG: max_seconds_to_wait_for_sqlcmd:', str(max_seconds_to_wait_for_sqlcmd)
 
         output = None
         while True:
@@ -880,9 +940,11 @@ def print_sql_statement(sql, num_chars_in_sql_type=6):
             except TimeoutException:
                 hanging_sql_commands.append(get_last_n_sql_statements(last_n_sql_statements, include_current_time=True))
                 if debug > 1:
-                        print "\nERROR: timeout waiting for (hanging?) sqlcmd, after", \
-                              str(max_seconds_to_wait_for_sqlcmd), "seconds, with:\n" + \
-                              get_last_n_sql_statements(last_n_sql_statements, include_current_time=True)
+                    print "\nERROR: timeout waiting for ('hanging') sqlcmd, after", \
+                          str(max_seconds_to_wait_for_sqlcmd), "seconds,\n" + \
+                          "(sql was partially/fully echoed: "+str(sql_partially_echoed_as_output) + \
+                          ", "+str(sql_was_echoed_as_output)+"), with:\n" + \
+                          get_last_n_sql_statements(last_n_sql_statements, include_current_time=True)
                 break
             else:
                 alarm(0)  # turns off the alarm
@@ -939,17 +1001,41 @@ def print_sql_statement(sql, num_chars_in_sql_type=6):
                 # Invalid 'exec', 'explainproc' & 'explainview' commands (etc.) sometimes
                 # respond with various messages that do not include 'ERROR'
                 elif any( all(err_msg in output for err_msg in kem) for kem in known_error_messages):
-                    if sql_was_echoed_as_output:
+                    if sql_was_echoed_as_output or sql_partially_echoed_as_output:
                         increment_sql_statement_types(sql, num_chars_in_sql_type, 'invalid',
                                                       sql_contains_echo_substring)
-                        break
-                    elif debug > 2:
+                        if sql_was_echoed_as_output:
+                            break
+                        elif debug > 1:
+                            print '\nDEBUG: found known_error_messages, with sql_partially_echoed_as_output, sql:\n    "' \
+                                    +sql+'"\nand output:\n    "'+output+'"\n'
+                    elif debug > 1:
                         # this can happen, though it's uncommon, when there is a multi-line
                         # error message, which uses the word 'ERROR' on one line and one of
                         # the known_error_messages, on another
                         print "\nDEBUG: Found invalid 'exec', 'explainproc', or 'explainview'", \
                               "error message before SQL echoed (rare condition), with:\n" + \
                               get_last_n_sql_statements(last_n_sql_statements)
+
+                # Special case, for the first line of multi-statement SQL
+                elif ';' in sql and sql.startswith(output.rstrip(';')):
+                    sql_partially_echoed_as_output = True
+                    # Used to test whether this new sql_partially_echoed_as_output code is useful
+                    count_sql_partially_echoed += 1
+                    if debug > 1:
+                        print '\nDEBUG: found (first) sql_partially_echoed_as_output, with output:\n    "' \
+                                +output+'"\nand sql:\n    "'+sql+'"\n'
+
+                # Special case, for a line (not the first) of multi-statement SQL
+                elif sql_partially_echoed_as_output and output.rstrip(';') in sql:
+                    if debug > 1:
+                        print '\nDEBUG: found (more) sql_partially_echoed_as_output, with sql:\n    "' \
+                                +sql+'"\nand output:\n    "'+output+'"\n'
+                    # For the last line of multi-statement SQL
+                    if sql.rstrip(';').endswith(output.rstrip(';')):
+                        sql_was_echoed_as_output = True
+                        if debug > 1:
+                            print "\nDEBUG: this was the last piece, so now sql_was_echoed_as_output is True"
 
                 # CREATE VIEW statements will occasionally simply return 'null' in sqlcmd;
                 # see ENG-15587: this is a known bug, so we don't want to exit or fail
@@ -1045,12 +1131,15 @@ def print_sql_statement(sql, num_chars_in_sql_type=6):
         print >> echo_output_file, "{0:27s}: {1:s}".format('Final sql', sql)
 
 
-def generate_sql_statements(sql_statement_type, num_sql_statements=0, max_save_statements=1000,
+def generate_sql_statements(sql_statement_type, num_sql_statements=0,
+                            max_save_sql_statements=1000, max_save_sqlcmd_outputs=1000,
                             delete_statement_type='truncate-statement', delete_statement_number=10):
     """Generate and print the specified number of SQL statements (num_sql_statements),
-    of the specified type (sql_statement_type); the output file(s) should contain
-    a maximum of the specified number of SQL statements (max_save_statements), meaning
-    that each time we reach that number, the output file(s) are deleted and begun again.
+    of the specified type (sql_statement_type); the (sql and sqlcmd) output files
+    should each contain a maximum of the specified number of SQL statements
+    (max_save_sql_statements and max_save_sqlcmd_outputs, respectively), meaning
+    that each time we reach one of those numbers, the respective output file is
+    deleted and begun again (with 0 meaning no limit).
     """
     global max_time, debug, grammar
     global count_sql_statements, sql_output_file, sqlcmd_output_file
@@ -1061,9 +1150,8 @@ def generate_sql_statements(sql_statement_type, num_sql_statements=0, max_save_s
 
     count = 0
     # Include any initial statements (e.g. INSERT) in the total count
-    if (count_sql_statements and count_sql_statements.get('total')
-                and count_sql_statements['total'].get('total')):
-        count = count_sql_statements['total'].get('total')
+    if (count_sql_statements and count_sql_statements.get('total')):
+        count = count_sql_statements['total'].get('total', 0)
 
     while count < num_sql_statements:
         count += 1
@@ -1073,25 +1161,30 @@ def generate_sql_statements(sql_statement_type, num_sql_statements=0, max_save_s
             break
         print_sql_statement(get_one_sql_statement(grammar, sql_statement_type))
 
-        # After every 'max_save_statements' statements, delete the output file(s)
-        # and start over, to avoid the file(s) becoming too large; at the same
-        # time, issue TRUNCATE (or DELETE) statements, in order to avoid the
-        # VoltDB server's memory growing too large
+        # After every 'max_save_sql_statements' statements, delete the SQL output
+        # file and start over with a new file, to avoid the file becoming too large
         if (count_sql_statements and count_sql_statements.get('total')
-                and count_sql_statements['total'].get('total') and max_save_statements
-                and not count_sql_statements['total']['total'] % max_save_statements):
-            if sql_output_file and sql_output_file is not sys.stdout:
-                filename = sql_output_file.name
-                sql_output_file.close()
-                sql_output_file = open(filename, 'w', 0)
-            if sqlcmd_output_file and sqlcmd_output_file is not sys.stdout:
-                filename = sqlcmd_output_file.name
-                sqlcmd_output_file.close()
-                sqlcmd_output_file = open(filename, 'w', 0)
-            for i in range(delete_statement_number):
-                # Include TRUNCATE (or DELETE) statements in the total count
-                count += 1
-                print_sql_statement(get_one_sql_statement(grammar, delete_statement_type))
+                and count_sql_statements['total'].get('total') ):
+            if (max_save_sql_statements and not
+                    count_sql_statements['total']['total'] % max_save_sql_statements):
+                if sql_output_file and sql_output_file is not sys.stdout:
+                    filename = sql_output_file.name
+                    sql_output_file.close()
+                    sql_output_file = open(filename, 'w', 0)
+            # Similarly, after every 'max_save_sqlcmd_outputs' statements, delete
+            # the sqlcmd output file and start over, to avoid the file becoming
+            # too large; at the same time, issue TRUNCATE (or DELETE) statements,
+            # in order to avoid the VoltDB server's memory growing too large
+            if (max_save_sqlcmd_outputs and not
+                    count_sql_statements['total']['total'] % max_save_sqlcmd_outputs):
+                if sqlcmd_output_file and sqlcmd_output_file is not sys.stdout:
+                    filename = sqlcmd_output_file.name
+                    sqlcmd_output_file.close()
+                    sqlcmd_output_file = open(filename, 'w', 0)
+                for i in range(delete_statement_number):
+                    # Include TRUNCATE (or DELETE) statements in the total count
+                    count += 1
+                    print_sql_statement(get_one_sql_statement(grammar, delete_statement_type))
 
 
 if __name__ == "__main__":
@@ -1106,12 +1199,15 @@ if __name__ == "__main__":
     parser.add_option("-r", "--seed", dest="seed", default=None,
                       help="seed for random number generator; a blank string, or None, means that the seed "
                           + "should itself be randomly generated [default: None]")
-    parser.add_option("-i", "--initial_type", dest="initial_type", default="insert-statement",
+    parser.add_option("-i", "--initial_type", dest="initial_type",
+                      default="create-table-statement,partition-table-stmnt,create-non-table-stmnt,"
+                          + "insert-statement,upsert-statement",
                       help="a type, or comma-separated list of types, of SQL statements to generate initially; "
                           + "typically used to initialize the database using DDL and INSERT statements "
-                          + "[default: ddl-statement,insert-statement]")
-    parser.add_option("-I", "--initial_number", dest="initial_number", default=5,
-                      help="the number of each INITIAL_TYPE of SQL statement to generate [default: 200]")
+                          + "[default: create-table-statement,partition-table-stmnt,create-non-table-stmnt,"
+                          + "insert-statement,upsert-statement]")
+    parser.add_option("-I", "--initial_number", dest="initial_number", default=20,
+                      help="the number of each INITIAL_TYPE of SQL statement to generate [default: 20]")
     parser.add_option("-t", "--type", dest="type", default="sql-statement",
                       help="a type, or comma-separated list of types, of SQL statements to generate "
                          + "(after the initial ones, if any) [default: sql-statement]")
@@ -1127,16 +1223,23 @@ if __name__ == "__main__":
                          + "server's memory does not grow too large [default: truncate-statement]")
     parser.add_option("-T", "--delete_number", dest="delete_number", default=10,
                       help="the number of DELETE_TYPE SQL statements to generate, each time [default: 10]")
-    parser.add_option("-x", "--max_save", dest="max_save", default=1000,
-                      help="the maximum number of SQL statements (and their results, if sqlcmd is called) to save "
-                         + "in the output files; after this many SQL statements, the output files are erased, and "
-                         + "DELETE_TYPE statements are called, to clear the database and start fresh [default: 1000]")
     parser.add_option("-o", "--output", dest="sql_output", default="sqlcmd.in",
                       help="an output file path/name, to which to send all generated SQL statements; "
                          + "if not specified, output goes to STDOUT [default: sqlcmd.in]")
     parser.add_option("-O", "--sqlcmd", dest="sqlcmd_output", default="sqlcmd.out",
-                      help="an output file path/name, to which sqlcmd output is sent, or STDOUT to send the output there; the "
-                         + "generated SQL statements are only passed to sqlcmd if this value exists [default: sqlcmd.out]")
+                      help="an output file path/name, to which sqlcmd output is sent, or STDOUT to send the output "
+                         + "there; the generated SQL statements are only passed to sqlcmd if this value exists "
+                         + "[default: sqlcmd.out]")
+    parser.add_option("-x", "--max_save_sql", dest="max_save_sql", default=1000,
+                      help="the maximum number of SQL statements to save in the SQL output file (SQL_OUTPUT); "
+                         + "after this many SQL statements, the SQL output file is erased and begun again; "
+                         + "a zero (0) value means no limit [default: 1000]")
+    parser.add_option("-X", "--max_save_sqlcmd", dest="max_save_sqlcmd", default=1000,
+                      help="the maximum number of SQL statements and their results (assuming sqlcmd is called) "
+                         + "to save in the sqlcmd output file (SQLCMD_OUTPUT); after this many SQL statements, "
+                         + "the sqlcmd output file is erased, and DELETE_NUUMBER DELETE_TYPE statements are "
+                         + "called, to (mostly) clear the database and start fresh; a zero (0) value means no "
+                         + "limit [default: 1000]")
     parser.add_option("-s", "--summary", dest="sqlcmd_summary", default="summary.out",
                       help="an output file path/name, to which a summary of all sqlcmd output is sent; a brief "
                          + "summary also goes to STDOUT, assuming that 'sqlcmd' exists [default: summary.out]")
@@ -1180,7 +1283,7 @@ if __name__ == "__main__":
                       help="a boolean value (True or False), specifying whether to include, in the ECHO_FILE, "
                          + "the list of grammar symbols, and how many times each one was used, for each of the "
                          + "SQL statements that is echoed [default: False]")
-    parser.add_option("-X", "--suffix", dest="suffix", default=None,
+    parser.add_option("-u", "--suffix", dest="suffix", default=None,
                       help="a suffix to be appended to the various output file names (but before their extensions); "
                          + "e.g., if SQLCMD_OUTPUT has its default value of 'sqlcmd.out', and SUFFIX is '123', then "
                          + "the actual sqlcmd output file will be named 'sqlcmd123.out' [default: None]")
@@ -1199,32 +1302,33 @@ if __name__ == "__main__":
     if debug > 1:
         print "DEBUG: all arguments:", " ".join(sys.argv)
         print "DEBUG: options (all):\n", options
-        print "DEBUG: args (all)            :", args
-        print "DEBUG: options.path          :", options.path
-        print "DEBUG: options.grammar_files :", options.grammar_files
-        print "DEBUG: options.seed          :", options.seed
-        print "DEBUG: options.initial_type  :", options.initial_type
-        print "DEBUG: options.initial_number:", options.initial_number
-        print "DEBUG: options.type          :", options.type
-        print "DEBUG: options.number        :", options.number
-        print "DEBUG: options.minutes       :", options.minutes
-        print "DEBUG: options.delete_type   :", options.delete_type
-        print "DEBUG: options.delete_number :", options.delete_number
-        print "DEBUG: options.max_save      :", options.max_save
-        print "DEBUG: options.sql_output    :", options.sql_output
-        print "DEBUG: options.sqlcmd_output :", options.sqlcmd_output
-        print "DEBUG: options.sqlcmd_summary:", options.sqlcmd_summary
-        print "DEBUG: options.summary_number:", options.summary_number
-        print "DEBUG: options.log_files     :", options.log_files
-        print "DEBUG: options.log_number    :", options.log_number
-        print "DEBUG: options.find_in_log   :", options.find_in_log
-        print "DEBUG: options.find_files    :", options.find_files
-        print "DEBUG: options.find_number   :", options.find_number
-        print "DEBUG: options.echo          :", options.echo
-        print "DEBUG: options.echo_file     :", options.echo_file
-        print "DEBUG: options.echo_grammar  :", options.echo_grammar
-        print "DEBUG: options.suffix        :", options.suffix
-        print "DEBUG: options.debug         :", options.debug
+        print "DEBUG: args (all)             :", args
+        print "DEBUG: options.path           :", options.path
+        print "DEBUG: options.grammar_files  :", options.grammar_files
+        print "DEBUG: options.seed           :", options.seed
+        print "DEBUG: options.initial_type   :", options.initial_type
+        print "DEBUG: options.initial_number :", options.initial_number
+        print "DEBUG: options.type           :", options.type
+        print "DEBUG: options.number         :", options.number
+        print "DEBUG: options.minutes        :", options.minutes
+        print "DEBUG: options.delete_type    :", options.delete_type
+        print "DEBUG: options.delete_number  :", options.delete_number
+        print "DEBUG: options.sql_output     :", options.sql_output
+        print "DEBUG: options.sqlcmd_output  :", options.sqlcmd_output
+        print "DEBUG: options.max_save_sql   :", options.max_save_sql
+        print "DEBUG: options.max_save_sqlcmd:", options.max_save_sqlcmd
+        print "DEBUG: options.sqlcmd_summary :", options.sqlcmd_summary
+        print "DEBUG: options.summary_number :", options.summary_number
+        print "DEBUG: options.log_files      :", options.log_files
+        print "DEBUG: options.log_number     :", options.log_number
+        print "DEBUG: options.find_in_log    :", options.find_in_log
+        print "DEBUG: options.find_files     :", options.find_files
+        print "DEBUG: options.find_number    :", options.find_number
+        print "DEBUG: options.echo           :", options.echo
+        print "DEBUG: options.echo_file      :", options.echo_file
+        print "DEBUG: options.echo_grammar   :", options.echo_grammar
+        print "DEBUG: options.suffix         :", options.suffix
+        print "DEBUG: options.debug          :", options.debug
 
     if options.seed:
         seed_type   = 'supplied'
@@ -1361,6 +1465,19 @@ if __name__ == "__main__":
                             ['failed to create the transaction internally'],
                             ['ParameterValueExpression', 'cannot be cast', 'TupleValueExpression'],
                             ['SQL Aggregate function calls with subquery expression arguments are not allowed'],
+                            ['Column', 'not found', 'Please update your query'],
+                            ['Index: 0, Size: 0'],    # See ENG-15736
+                            ['Column', 'cannot be nullable for TTL'],
+                            ['Partition columns must be an integer, varchar or varbinary type'],
+                            ['Partition columns must be constrained "NOT NULL"'],
+                            ['PARTITION has unknown COLUMN'],
+                            ['Invalid use of PRIMARY KEY'],
+                            ['Invalid use of UNIQUE'],
+                            ['Stream configured with materialized view without partitioned column'],
+                            ['Schema file ended mid-statement'],
+                            ['Object not found'],
+                            ['View does not support COUNT(DISTINCT) expression'],
+                            ['Table', 'cannot be swapped since it is used for exporting'],
                            ]
 
     # A list of headers found in responses to valid 'show' commands: one of
@@ -1374,15 +1491,20 @@ if __name__ == "__main__":
     # Initialize a list of any SQL (or other) commands that may hang sqlcmd
     hanging_sql_commands = []
 
+    # Used to test whether the new sql_partially_echoed_as_output code is useful
+    count_sql_partially_echoed = 0
+
     # Generate the specified number of each type of SQL statement;
     # and run each in sqlcmd, if the sqlcmd option was specified
     count_sql_statements = {}
     if options.initial_number:
+        total_initial_statement_count = 0
         for sql_statement_type in options.initial_type.split(','):
-            generate_sql_statements(sql_statement_type, int(options.initial_number))
+            total_initial_statement_count += int(options.initial_number)
+            generate_sql_statements(sql_statement_type, int(total_initial_statement_count))
     for sql_statement_type in options.type.split(','):
-        generate_sql_statements(sql_statement_type, int(options.number), int(options.max_save),
-                                options.delete_type, options.delete_number)
+        generate_sql_statements(sql_statement_type, int(options.number), int(options.max_save_sql),
+                                int(options.max_save_sqlcmd), options.delete_type, options.delete_number)
 
     if debug > 5:
         print_sql_statement('select * from P1;')

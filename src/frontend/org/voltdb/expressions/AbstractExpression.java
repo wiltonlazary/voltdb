@@ -23,6 +23,7 @@ import java.util.Map;
 import java.util.Set;
 
 import org.hsqldb_voltpatches.FunctionSQL;
+import org.hsqldb_voltpatches.FunctionForVoltDB.FunctionDescriptor;
 import org.json_voltpatches.JSONArray;
 import org.json_voltpatches.JSONException;
 import org.json_voltpatches.JSONObject;
@@ -1400,7 +1401,6 @@ public abstract class AbstractExpression implements JSONString, Cloneable {
      * This function will recursively find any function expression with ID functionId.
      * If found, return true. Otherwise, return false.
      *
-     * @param expr
      * @param functionId
      * @return
      */

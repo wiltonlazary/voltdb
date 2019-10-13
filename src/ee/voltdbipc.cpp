@@ -33,8 +33,8 @@
 #include "logging/StdoutLogProxy.h"
 #include "storage/table.h"
 
+#include "common/debuglog.h"
 #include "common/ElasticHashinator.h"
-#include "common/RecoveryProtoMessage.h"
 #include "common/serializeio.h"
 #include "common/SegvException.hpp"
 #include "common/SynchronizedThreadLock.h"
@@ -47,6 +47,7 @@
 
 static int g_cleanUpCountdownLatch = -1;
 static pthread_mutex_t g_cleanUpMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_cleanUpCondition = PTHREAD_COND_INITIALIZER;
 
 namespace voltdb {
 class Pool;
@@ -78,7 +79,12 @@ public:
         kErrorCode_needPlan = 110,                     // fetch a plan from java for a fragment
         kErrorCode_progressUpdate = 111,               // Update Java on execution progress
         kErrorCode_decodeBase64AndDecompress = 112,    // Decode base64, compressed data
-        kErrorCode_pushEndOfStream = 113               // Push EOF for dropped stream.
+        kErrorCode_pushEndOfStream = 113,              // Push EOF for dropped stream.
+        kErrorCode_callJavaUserDefinedAggregateStart = 114,  // Notify the frontend to call a Java user-defined aggregate function start method.
+        kErrorCode_callJavaUserDefinedAggregateAssemble = 115,  // Notify the frontend to call a Java user-defined aggregate function assemble method.
+        kErrorCode_callJavaUserDefinedAggregateCombine = 116,  // Notify the frontend to call a Java user-defined aggregate function combine method.
+        kErrorCode_callJavaUserDefinedAggregateWorkerEnd = 117,  // Notify the frontend to call a Java user-defined aggregate function worker end method.
+        kErrorCode_callJavaUserDefinedAggregateCoordinatorEnd = 118  // Notify the frontend to call a Java user-defined aggregate function coordinator end method.
     };
 
     VoltDBIPC(int fd);
@@ -141,10 +147,10 @@ public:
      * and this method will make sure that the VoltDBEngine is deleted and that the program will attempt
      * to free all memory allocated on the heap.
      */
-    void terminate();
+    void shutDown();
 
     int64_t getQueuedExportBytes(int32_t partitionId, std::string signature);
-    void pushExportBuffer(int32_t partitionId, std::string signature, voltdb::ExportStreamBlock *block, bool sync, int64_t generationId);
+    void pushExportBuffer(int32_t partitionId, std::string signature, voltdb::ExportStreamBlock *block);
     void pushEndOfStream(int32_t partitionId, std::string signature);
 
     int reportDRConflict(int32_t partitionId, int32_t remoteClusterId, int64_t remoteTimestamp, std::string tableName, voltdb::DRRecordType action,
@@ -180,8 +186,6 @@ private:
 
     int8_t quiesce(struct ipc_command *cmd);
 
-    int8_t shutDown();
-
     int8_t setLogLevels(struct ipc_command *cmd);
 
     void executePlanFragments(struct ipc_command *cmd);
@@ -189,8 +193,6 @@ private:
     void getStats(struct ipc_command *cmd);
 
     int8_t loadTable(struct ipc_command *cmd);
-
-    int8_t processRecoveryMessage( struct ipc_command *cmd);
 
     void tableHashCode( struct ipc_command *cmd);
 
@@ -206,7 +208,19 @@ private:
 
     void sendPerFragmentStatsBuffer();
 
+    int callJavaUserDefinedHelper(int kErrorCode);
+
     int callJavaUserDefinedFunction();
+
+    int callJavaUserDefinedAggregateStart(int functionId);
+
+    int callJavaUserDefinedAggregateAssemble();
+
+    int callJavaUserDefinedAggregateCombine();
+
+    int callJavaUserDefinedAggregateWorkerEnd();
+
+    int callJavaUserDefinedAggregateCoordinatorEnd();
 
     void setViewsEnabled(struct ipc_command*);
 
@@ -221,6 +235,7 @@ private:
     int8_t activateTableStream(struct ipc_command *cmd);
     void tableStreamSerializeMore(struct ipc_command *cmd);
     void exportAction(struct ipc_command *cmd);
+    void deleteMigratedRows(struct ipc_command *cmd);
     void getUSOForExportTable(struct ipc_command *cmd);
 
     void signalHandler(int signum, siginfo_t *info, void *context);
@@ -281,9 +296,7 @@ typedef struct {
     int64_t lastCommittedSpHandle;
     int64_t uniqueId;
     int64_t undoToken;
-    int32_t returnUniqueViolations;
-    int32_t shouldDRStream;
-    int32_t elastic;
+    int8_t callerId;
     char data[0];
 }__attribute__((packed)) load_table_cmd;
 
@@ -312,6 +325,7 @@ typedef struct {
     struct ipc_command cmd;
     voltdb::CatalogId tableId;
     voltdb::TableStreamType streamType;
+    voltdb::HiddenColumnFilter::Type hiddenColumnFilterType;
     int64_t undoToken;
     char data[0];
 }__attribute__((packed)) activate_tablestream;
@@ -358,14 +372,27 @@ typedef struct {
     int32_t isSync;
     int64_t offset;
     int64_t seqNo;
+    int64_t genId;
     int32_t tableSignatureLength;
     char tableSignature[0];
 }__attribute__((packed)) export_action;
 
 typedef struct {
     struct ipc_command cmd;
-    int32_t tableSignatureLength;
-    char tableSignature[0];
+    int64_t txnId;
+    int64_t spHandle;
+    int64_t uniqueId;
+    int64_t deletableTxnId;
+    int64_t undoToken;
+    int32_t maxRowCount;
+    int32_t tableNameLength;
+    char tableName[0];
+}__attribute__((packed)) delete_migrated_rows;
+
+typedef struct {
+    struct ipc_command cmd;
+    int32_t streamNameLength;
+    char streamName[0];
 }__attribute__((packed)) get_uso;
 
 typedef struct {
@@ -463,11 +490,13 @@ VoltDBIPC::VoltDBIPC(int fd)
 }
 
 VoltDBIPC::~VoltDBIPC() {
-    // Normally, all resources should be freed by the server calling "shutDown".
     if (m_engine != NULL) {
-        // If the server simulates a crash, shutDown message may never get sent.
-        // Clean up here so that valgrind doesn't complain
-        shutDown();
+        delete m_engine;
+        delete [] m_reusedResultBuffer;
+        delete [] m_perFragmentStatsBuffer;
+        delete [] m_udfBuffer;
+        delete [] m_tupleBuffer;
+        delete [] m_exceptionBuffer;
     }
 }
 
@@ -531,9 +560,6 @@ bool VoltDBIPC::execute(struct ipc_command *cmd) {
         exportAction(cmd);
         result = kErrorCode_None;
         break;
-      case 21:
-          result = processRecoveryMessage(cmd);
-        break;
       case 22:
           tableHashCode(cmd);
           result = kErrorCode_None;
@@ -563,10 +589,15 @@ bool VoltDBIPC::execute(struct ipc_command *cmd) {
           result = kErrorCode_None;
           break;
       case 30:
-          result = shutDown();
+          shutDown();
+          result = kErrorCode_Success;
           break;
       case 31:
           setViewsEnabled(cmd);
+          result = kErrorCode_None;
+          break;
+      case 32:
+          deleteMigratedRows(cmd);
           result = kErrorCode_None;
           break;
       default:
@@ -599,7 +630,7 @@ int8_t VoltDBIPC::loadCatalog(struct ipc_command *cmd) {
     if (staticDebugVerbose) {
         std::cout << "loadCatalog" << std::endl;
     }
-    assert(m_engine);
+    vassert(m_engine);
     if (!m_engine)
         return kErrorCode_Error;
 
@@ -618,7 +649,7 @@ int8_t VoltDBIPC::loadCatalog(struct ipc_command *cmd) {
 }
 
 int8_t VoltDBIPC::updateCatalog(struct ipc_command *cmd) {
-    assert(m_engine);
+    vassert(m_engine);
     update_catalog_cmd *uc = (update_catalog_cmd*) cmd;
     if (!m_engine) {
         return kErrorCode_Error;
@@ -641,11 +672,11 @@ int8_t VoltDBIPC::updateCatalog(struct ipc_command *cmd) {
 
 int8_t VoltDBIPC::initialize(struct ipc_command *cmd) {
     // expect a single initialization.
-    assert(!m_engine);
+    vassert(!m_engine);
     delete m_engine;
 
     // voltdbengine::initialize expects catalogids.
-    assert(sizeof(CatalogId) == sizeof(int));
+    vassert(sizeof(CatalogId) == sizeof(int));
 
     struct initialize {
         struct ipc_command cmd;
@@ -719,7 +750,7 @@ int8_t VoltDBIPC::initialize(struct ipc_command *cmd) {
 }
 
 int8_t VoltDBIPC::toggleProfiler(struct ipc_command *cmd) {
-    assert(m_engine);
+    vassert(m_engine);
     if (!m_engine)
         return kErrorCode_Error;
 
@@ -739,7 +770,7 @@ int8_t VoltDBIPC::toggleProfiler(struct ipc_command *cmd) {
 }
 
 int8_t VoltDBIPC::releaseUndoToken(struct ipc_command *cmd) {
-    assert(m_engine);
+    vassert(m_engine);
     if (!m_engine)
         return kErrorCode_Error;
 
@@ -757,7 +788,7 @@ int8_t VoltDBIPC::releaseUndoToken(struct ipc_command *cmd) {
 }
 
 int8_t VoltDBIPC::undoUndoToken(struct ipc_command *cmd) {
-    assert(m_engine);
+    vassert(m_engine);
     if (!m_engine)
         return kErrorCode_Error;
 
@@ -774,7 +805,7 @@ int8_t VoltDBIPC::undoUndoToken(struct ipc_command *cmd) {
 }
 
 int8_t VoltDBIPC::tick(struct ipc_command *cmd) {
-    assert (m_engine);
+    vassert(m_engine);
     if (!m_engine)
         return kErrorCode_Error;
 
@@ -812,19 +843,6 @@ int8_t VoltDBIPC::quiesce(struct ipc_command *cmd) {
     } catch (const FatalException &e) {
         crashVoltDB(e);
     }
-
-    return kErrorCode_Success;
-}
-
-int8_t VoltDBIPC::shutDown() {
-    delete m_engine;
-    delete [] m_reusedResultBuffer;
-    delete [] m_perFragmentStatsBuffer;
-    delete [] m_udfBuffer;
-    delete [] m_tupleBuffer;
-    delete [] m_exceptionBuffer;
-
-    m_engine = NULL;
 
     return kErrorCode_Success;
 }
@@ -914,14 +932,14 @@ void checkBytesRead(ssize_t byteCountExpected, ssize_t byteCountRead, std::strin
         printf("Error - blocking read of %s failed. %jd read %jd attempted",
                 description.c_str(), (intmax_t)byteCountRead, (intmax_t)byteCountExpected);
         fflush(stdout);
-        assert(false);
+        vassert(false);
         exit(-1);
     }
 }
 
-int VoltDBIPC::callJavaUserDefinedFunction() {
+int VoltDBIPC::callJavaUserDefinedHelper(int kErrorCode) {
     // Send a special status code indicating that a UDF invocation request is coming on the wire.
-    int8_t statusCode = static_cast<int8_t>(kErrorCode_callJavaUserDefinedFunction);
+    int8_t statusCode = static_cast<int8_t>(kErrorCode);
     writeOrDie(m_fd, (unsigned char*)&statusCode, sizeof(int8_t));
 
     // Get the UDF buffer size.
@@ -950,6 +968,33 @@ int VoltDBIPC::callJavaUserDefinedFunction() {
     bytes = read(m_fd, m_udfBuffer, udfBufferSizeToRecv);
     checkBytesRead(udfBufferSizeToRecv, bytes, "UDF return value buffer content");
     return retval;
+}
+
+int VoltDBIPC::callJavaUserDefinedFunction() {
+    return callJavaUserDefinedHelper(kErrorCode_callJavaUserDefinedFunction);
+}
+
+int VoltDBIPC::callJavaUserDefinedAggregateStart(int functionId) {
+    ReferenceSerializeOutput udfOutput(m_udfBuffer, MAX_MSG_SZ);
+    udfOutput.writeInt(sizeof(functionId));
+    udfOutput.writeInt(functionId);
+    return callJavaUserDefinedHelper(kErrorCode_callJavaUserDefinedAggregateStart);
+}
+
+int VoltDBIPC::callJavaUserDefinedAggregateAssemble() {
+    return callJavaUserDefinedHelper(kErrorCode_callJavaUserDefinedAggregateAssemble);
+}
+
+int VoltDBIPC::callJavaUserDefinedAggregateCombine() {
+    return callJavaUserDefinedHelper(kErrorCode_callJavaUserDefinedAggregateCombine);
+}
+
+int VoltDBIPC::callJavaUserDefinedAggregateWorkerEnd() {
+    return callJavaUserDefinedHelper(kErrorCode_callJavaUserDefinedAggregateWorkerEnd);
+}
+
+int VoltDBIPC::callJavaUserDefinedAggregateCoordinatorEnd() {
+    return callJavaUserDefinedHelper(kErrorCode_callJavaUserDefinedAggregateCoordinatorEnd);
 }
 
 void VoltDBIPC::sendException(int8_t errorCode) {
@@ -983,9 +1028,7 @@ int8_t VoltDBIPC::loadTable(struct ipc_command *cmd) {
     const int64_t lastCommittedSpHandle = ntohll(loadTableCommand->lastCommittedSpHandle);
     const int64_t uniqueId = ntohll(loadTableCommand->uniqueId);
     const int64_t undoToken = ntohll(loadTableCommand->undoToken);
-    const bool returnUniqueViolations = loadTableCommand->returnUniqueViolations != 0;
-    const bool shouldDRStream = loadTableCommand->shouldDRStream != 0;
-    const bool elastic = loadTableCommand->elastic != 0;
+    const LoadTableCaller &caller = LoadTableCaller::get(static_cast<LoadTableCaller::Id>(loadTableCommand->callerId));
     // ...and fast serialized table last.
     void* offset = loadTableCommand->data;
     int sz = static_cast<int> (ntohl(cmd->msgsize) - sizeof(load_table_cmd));
@@ -993,8 +1036,7 @@ int8_t VoltDBIPC::loadTable(struct ipc_command *cmd) {
         ReferenceSerializeInputBE serialize_in(offset, sz);
 
         bool success = m_engine->loadTable(tableId, serialize_in,
-                                           txnId, spHandle, lastCommittedSpHandle, uniqueId,
-                                           returnUniqueViolations, shouldDRStream, undoToken, elastic);
+                                           txnId, spHandle, lastCommittedSpHandle, uniqueId, undoToken, caller);
         if (success) {
             return kErrorCode_Success;
         } else {
@@ -1019,7 +1061,7 @@ int8_t VoltDBIPC::setLogLevels(struct ipc_command *cmd) {
     return kErrorCode_Success;
 }
 
-void VoltDBIPC::terminate() {
+void VoltDBIPC::shutDown() {
     m_terminate = true;
 }
 
@@ -1071,7 +1113,7 @@ char *VoltDBIPC::retrieveDependency(int32_t dependencyId, size_t *dependencySz) 
         printf("Error - blocking read failed. %jd read %jd attempted",
                 (intmax_t)bytes, (intmax_t)sizeof(int8_t));
         fflush(stdout);
-        assert(false);
+        vassert(false);
         exit(-1);
     }
 
@@ -1082,7 +1124,7 @@ char *VoltDBIPC::retrieveDependency(int32_t dependencyId, size_t *dependencySz) 
         printf("Received unexpected response code %d to retrieve dependency request\n",
                 (int)responseCode);
         fflush(stdout);
-        assert(false);
+        vassert(false);
         exit(-1);
     }
 
@@ -1093,7 +1135,7 @@ char *VoltDBIPC::retrieveDependency(int32_t dependencyId, size_t *dependencySz) 
         printf("Error - blocking read failed. %jd read %jd attempted",
                 (intmax_t)bytes, (intmax_t)sizeof(int32_t));
         fflush(stdout);
-        assert(false);
+        vassert(false);
         exit(-1);
     }
 
@@ -1117,7 +1159,7 @@ char *VoltDBIPC::retrieveDependency(int32_t dependencyId, size_t *dependencySz) 
         printf("Error - blocking read failed. %jd read %jd attempted",
                 (intmax_t)bytes, (intmax_t)dependencyLength);
         fflush(stdout);
-        assert(false);
+        vassert(false);
         exit(-1);
     }
     return dependencyData;
@@ -1132,7 +1174,7 @@ static std::string readLengthPrefixedBytesToStdString(int fd) {
     ssize_t numBytesRead = read(fd, &length, sizeof(int32_t));
     checkBytesRead(sizeof(int32_t), numBytesRead, "plan bytes length");
     length = static_cast<int32_t>(ntohl(length) - sizeof(int32_t));
-    assert(length > 0);
+    vassert(length > 0);
 
     boost::scoped_array<char> bytes(new char[length + 1]);
     numBytesRead = 0;
@@ -1236,7 +1278,7 @@ int64_t VoltDBIPC::fragmentProgressUpdate(
         printf("Error - blocking read after progress update failed. %jd read %jd attempted",
                 (intmax_t)bytes, (intmax_t)sizeof(nextStep));
         fflush(stdout);
-        assert(false);
+        vassert(false);
         exit(-1);
     }
     if (staticDebugVerbose) {
@@ -1370,7 +1412,8 @@ int8_t VoltDBIPC::activateTableStream(struct ipc_command *cmd) {
     ReferenceSerializeInputBE serialize_in(offset, sz);
 
     try {
-        if (m_engine->activateTableStream(tableId, streamType, undoToken, serialize_in)) {
+        if (m_engine->activateTableStream(tableId, streamType, activateTableStreamCommand->hiddenColumnFilterType,
+                undoToken, serialize_in)) {
             return kErrorCode_Success;
         } else {
             return kErrorCode_Error;
@@ -1475,15 +1518,6 @@ void VoltDBIPC::tableStreamSerializeMore(struct ipc_command *cmd) {
     }
 }
 
-int8_t VoltDBIPC::processRecoveryMessage( struct ipc_command *cmd) {
-    recovery_message *recoveryMessage = (recovery_message*) cmd;
-    const int32_t messageLength = ntohl(recoveryMessage->messageLength);
-    ReferenceSerializeInputBE input(recoveryMessage->message, messageLength);
-    RecoveryProtoMsg message(&input);
-    m_engine->processRecoveryMessage(&message);
-    return kErrorCode_Success;
-}
-
 void VoltDBIPC::tableHashCode( struct ipc_command *cmd) {
     table_hash_code *hashCodeRequest = (table_hash_code*) cmd;
     const int32_t tableId = ntohl(hashCodeRequest->tableId);
@@ -1501,25 +1535,43 @@ void VoltDBIPC::exportAction(struct ipc_command *cmd) {
     int32_t tableSignatureLength = ntohl(action->tableSignatureLength);
     std::string tableSignature(action->tableSignature, tableSignatureLength);
     int64_t result = m_engine->exportAction(action->isSync,
-                                         static_cast<int64_t>(ntohll(action->offset)),
-                                         static_cast<int64_t>(ntohll(action->seqNo)),
-                                         tableSignature);
+                                            static_cast<int64_t>(ntohll(action->offset)),
+                                            static_cast<int64_t>(ntohll(action->seqNo)),
+                                            static_cast<int64_t>(ntohll(action->genId)),
+                                            tableSignature);
 
     // write offset across bigendian.
     result = htonll(result);
     writeOrDie(m_fd, (unsigned char*)&result, sizeof(result));
 }
 
+void VoltDBIPC::deleteMigratedRows(struct ipc_command *cmd) {
+    delete_migrated_rows *migrate_msg = (delete_migrated_rows *)cmd;
+    m_engine->resetReusedResultOutputBuffer();
+    int32_t tableNameLength = ntohl(migrate_msg->tableNameLength);
+    std::string tableName(migrate_msg->tableName, tableNameLength);
+    bool result = m_engine->deleteMigratedRows(static_cast<int64_t>(ntohll(migrate_msg->txnId)),
+                                               static_cast<int64_t>(ntohll(migrate_msg->spHandle)),
+                                               static_cast<int64_t>(ntohll(migrate_msg->uniqueId)),
+                                               tableName,
+                                               static_cast<int64_t>(ntohll(migrate_msg->deletableTxnId)),
+                                               static_cast<int64_t>(ntohll(migrate_msg->undoToken)));
+    char response[1];
+    response[0] = result ? 1 : 0;
+    writeOrDie(m_fd, (unsigned char*)response, sizeof(int8_t));
+}
+
 void VoltDBIPC::getUSOForExportTable(struct ipc_command *cmd) {
     get_uso *get = (get_uso*)cmd;
 
     m_engine->resetReusedResultOutputBuffer();
-    int32_t tableSignatureLength = ntohl(get->tableSignatureLength);
-    std::string tableSignature(get->tableSignature, tableSignatureLength);
+    int32_t streamNameLength = ntohl(get->streamNameLength);
+    std::string streamNameStr(get->streamName, streamNameLength);
 
     size_t ackOffset;
     int64_t seqNo;
-    m_engine->getUSOForExportTable(ackOffset, seqNo, tableSignature);
+    int64_t genId;
+    m_engine->getUSOForExportTable(ackOffset, seqNo, genId, streamNameStr);
 
     // write offset across bigendian.
     int64_t ackOffsetI64 = static_cast<int64_t>(ackOffset);
@@ -1529,6 +1581,9 @@ void VoltDBIPC::getUSOForExportTable(struct ipc_command *cmd) {
     // write the poll data. It is at least 4 bytes of length prefix.
     seqNo = htonll(seqNo);
     writeOrDie(m_fd, (unsigned char*)&seqNo, sizeof(seqNo));
+
+    genId = htonll(genId);
+    writeOrDie(m_fd, (unsigned char*)&genId, sizeof(genId));
 }
 
 void VoltDBIPC::hashinate(struct ipc_command* cmd) {
@@ -1545,7 +1600,7 @@ void VoltDBIPC::hashinate(struct ipc_command* cmd) {
     int retval = -1;
     try {
         int cnt = serialize_in.readShort();
-        assert(cnt> -1);
+        vassert(cnt> -1);
         Pool *pool = m_engine->getStringPool();
         deserializeParameterSetCommon(cnt, serialize_in, params, pool);
         retval =
@@ -1575,6 +1630,7 @@ void VoltDBIPC::signalHandler(int signum, siginfo_t *info, void *context) {
     snprintf(err_msg, 128, "SIGSEGV caught: signal number %d, error value %d,"
              " signal code %d\n\n", info->si_signo, info->si_errno,
              info->si_code);
+    err_msg[sizeof err_msg - 1] = '\0';
     std::string message = err_msg;
     message.append(m_engine->debug());
     crashVoltDB(SegvException(message.c_str(), context, __FILE__, __LINE__));
@@ -1607,9 +1663,7 @@ void VoltDBIPC::threadLocalPoolAllocations() {
 void VoltDBIPC::pushExportBuffer(
         int32_t partitionId,
         std::string signature,
-        voltdb::ExportStreamBlock *block,
-        bool sync,
-        int64_t generationId) {
+        voltdb::ExportStreamBlock *block) {
     int32_t index = 0;
     m_reusedResultBuffer[index++] = kErrorCode_pushExportBuffer;
     *reinterpret_cast<int32_t*>(&m_reusedResultBuffer[index]) = htonl(partitionId);
@@ -1620,19 +1674,16 @@ void VoltDBIPC::pushExportBuffer(
     index += static_cast<int32_t>(signature.size());
     if (block != NULL) {
         *reinterpret_cast<int64_t*>(&m_reusedResultBuffer[index]) = htonll(block->startSequenceNumber());
-        *reinterpret_cast<int64_t*>(&m_reusedResultBuffer[index+8]) = htonll(block->getRowCount());
-        *reinterpret_cast<int64_t*>(&m_reusedResultBuffer[index+16]) = htonll(block->lastSpUniqueId());
+        *reinterpret_cast<int64_t*>(&m_reusedResultBuffer[index+8]) = htonll(block->getCommittedSequenceNumber());
+        *reinterpret_cast<int64_t*>(&m_reusedResultBuffer[index+16]) = htonll(block->getRowCount());
+        *reinterpret_cast<int64_t*>(&m_reusedResultBuffer[index+24]) = htonll(block->lastSpUniqueId());
     } else {
         *reinterpret_cast<int64_t*>(&m_reusedResultBuffer[index]) = 0;
         *reinterpret_cast<int64_t*>(&m_reusedResultBuffer[index+8]) = 0;
         *reinterpret_cast<int64_t*>(&m_reusedResultBuffer[index+16]) = 0;
+        *reinterpret_cast<int64_t*>(&m_reusedResultBuffer[index+24]) = 0;
     }
-    index += 24;
-    *reinterpret_cast<int8_t*>(&m_reusedResultBuffer[index++]) =
-        sync ?
-            static_cast<int8_t>(1) : static_cast<int8_t>(0);
-    index += 8;
-    *reinterpret_cast<int32_t*>(&m_reusedResultBuffer[index]) = htonll(generationId);
+    index += 32;
     if (block != NULL) {
         *reinterpret_cast<int32_t*>(&m_reusedResultBuffer[index]) = htonl(block->rawLength());
         writeOrDie(m_fd, (unsigned char*)m_reusedResultBuffer, index + 4);
@@ -1737,23 +1788,22 @@ struct VoltDBIPCDeleter {
         if (voltipc->getEngine() == NULL || !voltipc->getEngine()->isLowestSite()) {
             // if the engine was already destroyed, or if it's not the lowest site,
             // just decrement the latch.
+            delete voltipc;
             pthread_mutex_lock(&g_cleanUpMutex);
-            --g_cleanUpCountdownLatch;
+            if (--g_cleanUpCountdownLatch <= 1) {
+                pthread_cond_broadcast(&g_cleanUpCondition);
+            }
             pthread_mutex_unlock(&g_cleanUpMutex);
         }
         else {
             // The lowest site: wait for the other sites to shut down before exiting.
-            while (true) {
-                pthread_mutex_lock(&g_cleanUpMutex);
-                volatile int latchVal = g_cleanUpCountdownLatch;
-                pthread_mutex_unlock(&g_cleanUpMutex);
-                if (latchVal <= 1) {
-                    break;
-                }
+            pthread_mutex_lock(&g_cleanUpMutex);
+            while (g_cleanUpCountdownLatch > 1) {
+                pthread_cond_wait(&g_cleanUpCondition, &g_cleanUpMutex);
             }
+            pthread_mutex_unlock(&g_cleanUpMutex);
+            delete voltipc;
         }
-
-        delete voltipc;
     }
 };
 
@@ -1837,7 +1887,7 @@ void *eethread(void *ptr) {
                 std::cout << std::endl;
             }
         }
-        assert(ntohl(cmd->msgsize) >= sizeof(struct ipc_command));
+        vassert(ntohl(cmd->msgsize) >= sizeof(struct ipc_command));
         if (staticDebugVerbose) {
             std::cout << "Completed command: " << ntohl(cmd->command) << std::endl;
         }
@@ -1865,9 +1915,9 @@ int main(int argc, char **argv) {
     // allow caller to specify the number of ees - defaults to 1
     if (argc >= 2) {
         char *eecountStr = argv[1];
-        assert(eecountStr);
+        vassert(eecountStr);
         eecount = atoi(eecountStr);
-        assert(eecount >= 0);
+        vassert(eecount >= 0);
     // NOTE: EEProcess.java code validates the first few lines of this process
     // output, so keep it up to date with these printfs.
         printf("== eecount = %d ==\n", eecount);
@@ -1878,10 +1928,10 @@ int main(int argc, char **argv) {
     // allow caller to override port with the second argument
     if (argc == 3) {
         char *portStr = argv[2];
-        assert(portStr);
+        vassert(portStr);
         port = atoi(portStr);
-        assert(port > 0);
-        assert(port <= 65535);
+        vassert(port > 0);
+        vassert(port <= 65535);
     }
 
     struct sockaddr_in address;
@@ -1957,7 +2007,7 @@ int main(int argc, char **argv) {
         int code = pthread_join(eeThreads[ee], NULL);
         // stupid if to avoid compiler warning
         if (code != 0) {
-            assert(code == 0);
+            vassert(code == 0);
         }
     }
 

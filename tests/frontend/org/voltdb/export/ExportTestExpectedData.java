@@ -25,6 +25,7 @@ package org.voltdb.export;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -40,26 +41,26 @@ public class ExportTestExpectedData {
     // hash table name + partition to verifier
     public final Map<String, ExportToSocketTestVerifier> m_verifiers = new HashMap<>();
     public final Map<String, Boolean> m_seen_verifiers = new HashMap<>();
-    public final Map<String, Integer> m_count = new HashMap<>();
+    public final Map<String, Integer> m_expectedRowCount = new HashMap<>();
 
-    private final Map<String, ServerListener> m_severSockets;
+    private final Map<String, ServerListener> m_serverSockets;
+    // TODO: support per-table replicated stream check
     private final boolean m_replicated;
     private final boolean m_exact;
     private final long m_copies;
     public boolean m_verifySequenceNumber = true;
+    public boolean m_verbose = true;
 
     public ExportTestExpectedData(Map<String, ServerListener> serverSockets, boolean isExportReplicated, boolean exact,
             int copies) {
-        m_severSockets = serverSockets;
+        m_serverSockets = serverSockets;
         m_replicated = isExportReplicated;
         m_exact = exact;
         m_copies = copies;
     }
 
-    public synchronized void addRow(Client client, String tableName, Object partitionHash, Object[] data)
-            throws Exception {
-        long partition = ((ClientImpl) client).getPartitionForParameter(VoltType.typeFromObject(partitionHash)
-                .getValue(), partitionHash);
+    public synchronized void addRow(Client client, String tableName, Object partitionHash, Object[] data) {
+        long partition = getPartitionFromHashinator(client, partitionHash);
         ExportToSocketTestVerifier verifier = m_verifiers.get(tableName + partition);
         if (verifier == null) {
             verifier = new ExportToSocketTestVerifier(tableName, (int) partition);
@@ -67,47 +68,85 @@ public class ExportTestExpectedData {
             m_seen_verifiers.put(tableName + partition, Boolean.TRUE);
         }
         verifier.addRow(data);
-        Integer count = m_count.get(tableName);
+        Integer count = m_expectedRowCount.get(tableName);
         if (count == null) {
-            m_count.put(tableName,1);
+            m_expectedRowCount.put(tableName,1);
         }
          else {
-            m_count.put(tableName,count+1);
+            m_expectedRowCount.put(tableName,count+1);
         }
+    }
+
+    // All export tests using verifiers should ensure their clients have
+    // an initialized hashinator, otherwise some calls to addRow() will be directed to
+    // a partitionId of -1
+    private long getPartitionFromHashinator(Client client, Object partitionHash) {
+        long partition = ((ClientImpl) client).getPartitionForParameter(
+                VoltType.typeFromObject(partitionHash).getValue(), partitionHash);
+        if (partition != -1) {
+            return partition;
+        }
+        int sleptTimes = 0;
+        while (!((ClientImpl) client).isHashinatorInitialized() && sleptTimes < 60000) {
+            try {
+                Thread.sleep(1);
+                sleptTimes++;
+            } catch (InterruptedException ex) {
+                ;
+            }
+        }
+        assertTrue(sleptTimes < 60000);
+        partition = ((ClientImpl) client).getPartitionForParameter(
+                VoltType.typeFromObject(partitionHash).getValue(), partitionHash);
+        assertTrue(partition != -1);
+        return partition;
     }
 
     public synchronized void verifyRows() throws Exception {
         /*
          * Process the row data in each table
          */
-        for (Entry<String, ServerListener> f : m_severSockets.entrySet()) {
+        for (Entry<String, ServerListener> f : m_serverSockets.entrySet()) {
             String tableName = f.getKey();
             System.out.println("Processing Table:" + tableName);
 
             String next[] = null;
-            assertEquals(getSize(tableName), f.getValue().getSize());
+            assertEquals(getExpectedRowCount(tableName), f.getValue().getReceivedRowCount());
+            if (!m_exact) {
+                continue;
+            }
             while ((next = f.getValue().getNext()) != null) {
                 final int partitionId = Integer.valueOf(next[3]);
-                StringBuilder sb = new StringBuilder();
-                for (String s : next) {
-                    sb.append(s).append(", ");
+                if (m_verbose) {
+                    StringBuilder sb = new StringBuilder();
+                    for (String s : next) {
+                        sb.append(s).append(", ");
+                    }
+                    System.out.println(sb);
                 }
-                System.out.println(sb);
                 ExportToSocketTestVerifier verifier = m_verifiers.get(tableName + partitionId);
                 Long rowSeq = Long.parseLong(next[ExportDecoderBase.INTERNAL_FIELD_COUNT]);
 
                 // verify occurrence if replicated
-                if (m_replicated && m_exact) {
+                if (m_replicated) {
                     assertEquals(m_copies, f.getValue().getCount(rowSeq));
                 }
-
-                assertThat( next, verifier.isExpectedRow(m_verifySequenceNumber));
+                if (verifier != null) {
+                    assertThat( next, verifier.isExpectedRow(m_verifySequenceNumber));
+                }
             }
         }
     }
 
-    private int getSize(String tableName) {
-        return m_count.containsKey(tableName) ? m_count.get(tableName) : 0;
+    public synchronized void ignoreRow(String tableName, long rowId) {
+        ServerListener listener = m_serverSockets.get(tableName);
+        if (listener != null) {
+            listener.ignoreRow(rowId);
+        }
+    }
+
+    private int getExpectedRowCount(String tableName) {
+        return m_expectedRowCount.containsKey(tableName) ? m_expectedRowCount.get(tableName) : 0;
     }
 
     public long getExportedDataCount() {

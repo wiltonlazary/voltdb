@@ -40,8 +40,7 @@ MaterializedViewTriggerForInsert::MaterializedViewTriggerForInsert(PersistentTab
     , m_searchKeyValue(m_groupByColumnCount)
     , m_aggColumnCount(parseAggregation(mvInfo))
     , m_supportSnapshot(true)
-    , m_enabled(true)
-{
+    , m_enabled(true) {
     VOLT_TRACE("Construct MaterializedViewTriggerForInsert...");
 
     m_mvInfo = mvInfo;
@@ -85,9 +84,7 @@ void MaterializedViewTriggerForInsert::setEnabled(bool enabled) {
         // If this view should not respond to any view status toggle requests
         // (because the view is implicitly partitioned), ignore them.
         return;
-    }
-    // If the value is not changed, no action needs to be taken.
-    if (m_enabled == enabled) {
+    } else if (m_enabled == enabled) { // If the value is not changed, no action needs to be taken.
         return;
     }
     // Only views that can be snapshotted are allowed to be disabled.
@@ -99,14 +96,14 @@ void MaterializedViewTriggerForInsert::setEnabled(bool enabled) {
         // we need to use a delta table to hold the view content restored from
         // the snapshot and do a manual merge afterwards.
         m_dest->instantiateDeltaTable(noNeedToCheckMemoryContext);
-    }
-    else if (m_enabled && m_dest->deltaTable()) {
+    } else if (m_enabled && m_dest->deltaTable()) {
         // When we turn on the maintenance, if a delta table exists, it means that the view table was
         // not empty at the time when we paused it.
         // In this case, we need to do a merge. Log a message for it.
         char msg[256];
         snprintf(msg, sizeof(msg), "Merging the pre-existing content in view %s with the snapshot data.",
                  m_dest->name().c_str());
+        msg[sizeof msg - 1] = '\0';
         LogManager::getThreadLogger(LOGGERID_HOST)->log(LOGLEVEL_INFO, msg);
 
         PersistentTable* delta = m_dest->deltaTable();
@@ -121,8 +118,8 @@ void MaterializedViewTriggerForInsert::setEnabled(bool enabled) {
                 mergeTupleForInsert(deltaTuple);
                 // Shouldn't need to update group-key-only indexes such as the primary key
                 // since their keys shouldn't ever change, but do update other indexes.
-                m_dest->updateTupleWithSpecificIndexes(m_existingTuple, m_updatedTuple,
-                                                       m_updatableIndexList, false);
+                m_dest->updateTupleWithSpecificIndexes(
+                      m_existingTuple, m_updatedTuple, m_updatableIndexList, false);
             }
             else {
                 m_dest->insertPersistentTuple(deltaTuple, false);
@@ -151,8 +148,7 @@ void MaterializedViewTriggerForInsert::mergeTupleForInsert(const TableTuple &del
         NValue newValue = deltaTuple.getNValue(columnIndex);
         if (newValue.isNull()) {
             newValue = existingValue;
-        }
-        else {
+        } else {
             switch(m_aggTypes[aggIndex]) {
                 case EXPRESSION_TYPE_AGGREGATE_SUM:
                 case EXPRESSION_TYPE_AGGREGATE_COUNT:
@@ -174,7 +170,7 @@ void MaterializedViewTriggerForInsert::mergeTupleForInsert(const TableTuple &del
                     }
                     break;
                 default:
-                    assert(false); // Should have been caught when the matview was loaded.
+                    vassert(false); // Should have been caught when the matview was loaded.
                     // no break
             }
         }
@@ -201,9 +197,8 @@ void MaterializedViewTriggerForInsert::updateDefinition(PersistentTable *destTab
 }
 
 // numCountStar is needed because COUNT(*) is not part of m_aggExprs
-NValue MaterializedViewTriggerForInsert::getAggInputFromSrcTuple(int aggIndex,
-                                                                 int numCountStar,
-                                                                 const TableTuple& tuple) {
+NValue MaterializedViewTriggerForInsert::getAggInputFromSrcTuple(
+      int aggIndex, int numCountStar, const TableTuple& tuple) {
     if (m_aggExprs.size() != 0) {
         AbstractExpression* aggExpr = m_aggExprs[aggIndex - numCountStar];
         return aggExpr->eval(&tuple, NULL);
@@ -213,24 +208,22 @@ NValue MaterializedViewTriggerForInsert::getAggInputFromSrcTuple(int aggIndex,
     return tuple.getNValue(srcColIdx);
 }
 
-void MaterializedViewTriggerForInsert::processTupleInsert(const TableTuple &newTuple,
-                                                          bool fallible) {
+void MaterializedViewTriggerForInsert::processTupleInsert(const TableTuple &newTuple, bool fallible) {
     // If the view is not enabled, ignore it.
     // Snapshots will only do inserts, so this check is not added to handleTupleDelete.
     if (! m_enabled) {
         return;
-    }
-    // don't change the view if this tuple doesn't match the predicate
-    if (failsPredicate(newTuple)) {
+    } else if (failsPredicate(newTuple)) {
+       // don't change the view if this tuple doesn't match the predicate
         return;
     }
-    bool exists = findExistingTuple(newTuple);
+
+    bool const exists = findExistingTuple(newTuple);
     if (!exists) {
         // create a blank tuple
-        VOLT_TRACE("newTuple does not exist,create a blank tuple");
+        VOLT_TRACE("newTuple does not exist, create a blank tuple");
         m_existingTuple.move(m_emptyTuple.address());
     }
-
     // clear the tuple that will be built to insert or overwrite
     memset(m_updatedTuple.address(), 0, m_dest->getTupleLength());
 
@@ -250,9 +243,7 @@ void MaterializedViewTriggerForInsert::processTupleInsert(const TableTuple &newT
     // set values for the other columns
     // update or insert the row
     if (exists) {
-
         for (int aggIndex = 0; aggIndex < m_aggColumnCount; aggIndex++) {
-
             NValue existingValue = m_existingTuple.getNValue(aggOffset+aggIndex);
             if (m_aggTypes[aggIndex] == EXPRESSION_TYPE_AGGREGATE_COUNT_STAR) {
                 m_updatedTuple.setNValue( (int)(aggOffset+aggIndex),
@@ -265,49 +256,44 @@ void MaterializedViewTriggerForInsert::processTupleInsert(const TableTuple &newT
             NValue newValue = getAggInputFromSrcTuple(aggIndex, numCountStar, newTuple);
             if (newValue.isNull()) {
                 newValue = existingValue;
-            }
-            else {
+            } else {
                 switch(m_aggTypes[aggIndex]) {
-                case EXPRESSION_TYPE_AGGREGATE_SUM:
-                    if (!existingValue.isNull()) {
-                        newValue = existingValue.op_add(newValue);
-                    }
-                    break;
-                case EXPRESSION_TYPE_AGGREGATE_COUNT:
-                    newValue = existingValue.op_increment();
-                    break;
-                case EXPRESSION_TYPE_AGGREGATE_MIN:
-                    // ignore any new value that is not strictly an improvement
-                    if (!existingValue.isNull() && newValue.compare(existingValue) >= 0) {
-                        newValue = existingValue;
-                    }
-                    break;
-                case EXPRESSION_TYPE_AGGREGATE_MAX:
-                    // ignore any new value that is not strictly an improvement
-                    if (!existingValue.isNull() && newValue.compare(existingValue) <= 0) {
-                        newValue = existingValue;
-                    }
-                    break;
-                default:
-                    assert(false); // Should have been caught when the matview was loaded.
-                    // no break
-                }
+                   case EXPRESSION_TYPE_AGGREGATE_SUM:
+                       if (!existingValue.isNull()) {
+                          newValue = existingValue.op_add(newValue);
+                       }
+                       break;
+                   case EXPRESSION_TYPE_AGGREGATE_COUNT:
+                       newValue = existingValue.op_increment();
+                       break;
+                   case EXPRESSION_TYPE_AGGREGATE_MIN:
+                       // ignore any new value that is not strictly an improvement
+                       if (!existingValue.isNull() && newValue.compare(existingValue) >= 0) {
+                          newValue = existingValue;
+                       }
+                       break;
+                   case EXPRESSION_TYPE_AGGREGATE_MAX:
+                       // ignore any new value that is not strictly an improvement
+                       if (!existingValue.isNull() && newValue.compare(existingValue) <= 0) {
+                          newValue = existingValue;
+                       }
+                       break;
+                   default:
+                       vassert(false); // Should have been caught when the matview was loaded.
+               }
             }
             m_updatedTuple.setNValue(aggOffset+aggIndex, newValue);
         }
         // ENG-10892, if no COUNT(*) column exists
         if (numCountStar == 0) {
             // check which hidden column COUNT(*) lies in, it is always the last one
-            assert(m_dest->schema()->hiddenColumnCount() == 1);
+            vassert(m_dest->schema()->hiddenColumnCount() == 1);
             m_updatedTuple.setHiddenNValue(0, m_existingTuple.getHiddenNValue(0).op_increment());
         }
-
         // Shouldn't need to update group-key-only indexes such as the primary key
         // since their keys shouldn't ever change, but do update other indexes.
-        m_dest->updateTupleWithSpecificIndexes(m_existingTuple, m_updatedTuple,
-                                               m_updatableIndexList, fallible);
-    }
-    else {
+        m_dest->updateTupleWithSpecificIndexes(m_existingTuple, m_updatedTuple, m_updatableIndexList, fallible);
+    } else {
         int numCountStar = 0;
         // A new group row gets its initial agg values copied directly from the first source row
         // except for user-defined COUNTs which get set to 0 or 1 depending on whether the
@@ -323,8 +309,7 @@ void MaterializedViewTriggerForInsert::processTupleInsert(const TableTuple &newT
             if (m_aggTypes[aggIndex] == EXPRESSION_TYPE_AGGREGATE_COUNT) {
                 if (newValue.isNull()) {
                     newValue = ValueFactory::getBigIntValue(0);
-                }
-                else {
+                } else {
                     newValue = ValueFactory::getBigIntValue(1);
                 }
             }
@@ -333,7 +318,7 @@ void MaterializedViewTriggerForInsert::processTupleInsert(const TableTuple &newT
         // ENG-10892, if no COUNT(*) column exists
         if (numCountStar == 0) {
             // check which hidden column COUNT(*) lies in, it is always the last one
-            assert(m_dest->schema()->hiddenColumnCount() == 1);
+            vassert(m_dest->schema()->hiddenColumnCount() == 1);
             m_updatedTuple.setHiddenNValue(0, ValueFactory::getBigIntValue(1));
         }
         m_dest->insertPersistentTuple(m_updatedTuple, fallible);
@@ -361,8 +346,7 @@ void MaterializedViewTriggerForInsert::allocateBackedTuples() {
     // In this case, we will not allocate space for m_searchKeyBackingStore (ENG-7872)
     if (m_groupByColumnCount == 0) {
         m_searchKeyBackingStore.reset();
-    }
-    else {
+    } else {
         m_searchKeyTuple = TableTuple(m_index->getKeySchema());
         storeLength = m_index->getKeySchema()->tupleLength() + TUPLE_HEADER_SIZE;
         backingStore = new char[storeLength];
@@ -393,7 +377,7 @@ AbstractExpression* MaterializedViewTriggerForInsert::parsePredicate(catalog::Ma
     if (hexString.size() == 0) {
         return NULL;
     }
-    assert (hexString.length() % 2 == 0);
+    vassert(hexString.length() % 2 == 0);
     int bufferLength = (int)hexString.size() / 2 + 1;
     boost::shared_array<char> buffer(new char[bufferLength]);
     catalog::Catalog::hexDecodeString(hexString, buffer.get());
@@ -402,7 +386,7 @@ AbstractExpression* MaterializedViewTriggerForInsert::parsePredicate(catalog::Ma
     if (domRoot.isNull()) {
         return NULL;
     }
-    PlannerDomValue expr = domRoot.rootObject();
+    PlannerDomValue expr = domRoot();
     return AbstractExpression::buildExpressionTree(expr);
 }
 
@@ -454,20 +438,17 @@ std::size_t MaterializedViewTriggerForInsert::parseAggregation(catalog::Material
             case EXPRESSION_TYPE_AGGREGATE_MIN:
             case EXPRESSION_TYPE_AGGREGATE_MAX:
                 break; // legal value
-            default: {
-                char message[128];
-                snprintf(message, 128, "Error in materialized view aggregation %d expression type %s",
-                         (int)aggIndex, expressionToString(m_aggTypes[aggIndex]).c_str());
-                throw SerializableEEException(VOLT_EE_EXCEPTION_TYPE_EEEXCEPTION,
-                                              message);
-            }
+            default:
+                throwSerializableEEException(
+                        "Error in materialized view aggregation %d expression type %s",
+                        (int)aggIndex, expressionToString(m_aggTypes[aggIndex]).c_str());
         }
         if (usesComplexAgg || (m_aggTypes[aggIndex] == EXPRESSION_TYPE_AGGREGATE_COUNT_STAR) ) {
             continue;
         }
         // Not used for Complex Aggregation case
         const catalog::Column *srcCol = destCol->matviewsource();
-        assert(srcCol);
+        vassert(srcCol);
         m_aggColIndexes[aggIndex] = srcCol->index();
     }
 
@@ -504,15 +485,14 @@ void MaterializedViewTriggerForInsert::initializeTupleHavingNoGroupBy(bool falli
         if (m_aggTypes[aggIndex] == EXPRESSION_TYPE_AGGREGATE_COUNT ||
             m_aggTypes[aggIndex] == EXPRESSION_TYPE_AGGREGATE_COUNT_STAR) {
             newValue = ValueFactory::getBigIntValue(0);
-        }
-        else {
+        } else {
             newValue = NValue::getNullValue(m_updatedTuple.getSchema()->columnType(aggOffset+aggIndex));
         }
         m_updatedTuple.setNValue(aggOffset+aggIndex, newValue);
     }
     // ENG-10892, if no COUNT(*) exists
     if (m_countStarColumnIndex == -1) {
-        assert(m_dest->schema()->hiddenColumnCount() == 1);
+        vassert(m_dest->schema()->hiddenColumnCount() == 1);
         m_updatedTuple.setHiddenNValue(0, ValueFactory::getBigIntValue(0));
     }
     m_dest->insertPersistentTuple(m_updatedTuple, fallible);
@@ -525,7 +505,7 @@ bool MaterializedViewTriggerForInsert::findExistingTupleUsingDelta(const TableTu
     if (m_groupByColumnCount == 0) {
         TableIterator iterator = m_dest->iterator();
         iterator.next(m_existingTuple);
-        assert( ! m_existingTuple.isNullTuple());
+        vassert( ! m_existingTuple.isNullTuple());
         return true;
     }
 
@@ -542,7 +522,7 @@ bool MaterializedViewTriggerForInsert::findExistingTuple(const TableTuple &tuple
     if (m_groupByColumnCount == 0) {
         TableIterator iterator = m_dest->iterator();
         iterator.next(m_existingTuple);
-        assert( ! m_existingTuple.isNullTuple());
+        vassert( ! m_existingTuple.isNullTuple());
         return true;
     }
 

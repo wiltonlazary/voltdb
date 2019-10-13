@@ -25,7 +25,7 @@ import org.voltcore.utils.DBBPool;
  * Represents a reader for a segment. Multiple readers may be active
  * at any point in time, reading from different locations in the segment.
  */
-interface PBDSegmentReader {
+interface PBDSegmentReader<M> {
     /**
      * Are there any more entries to read from this segment for this reader
      *
@@ -35,31 +35,26 @@ interface PBDSegmentReader {
     public boolean hasMoreEntries() throws IOException;
 
     /**
-     * Have all the entries in this segment been read by this reader and
-     * acknowledged as ready for discarding.
-     *
-     * @return true if all entries have been read and discarded by this reader. False otherwise.
-     * @throws IOException if the reader was closed
+     * @return {@code true} if any entries have been read and discarded from this segment
      */
-    public boolean allReadAndDiscarded() throws IOException;
+    public boolean anyReadAndDiscarded();
 
     /**
      * Read the next entry from the segment for this reader.
      * Returns null if all entries in this segment were already read by this reader.
      *
      * @param factory
-     * @param checkCRC
-     * @return BBContainer with the bytes read
+     * @return BBContainer with the bytes read or {@code null} if all entries have been consumed
      * @throws IOException
      */
-    public DBBPool.BBContainer poll(BinaryDeque.OutputContainerFactory factory,
-            boolean checkCRC) throws IOException;
+    public DBBPool.BBContainer poll(BinaryDeque.OutputContainerFactory factory) throws IOException;
 
     /**
      * @return A {@link DBBPool.BBContainer} with the extra header supplied for the segment or {@code null} if one was
      *         not supplied
      * @throws IOException If an error occurs while reading the extra header
      */
+    @Deprecated
     public DBBPool.BBContainer getExtraHeader() throws IOException;
 
     //Don't use size in bytes to determine empty, could potentially
@@ -90,13 +85,18 @@ interface PBDSegmentReader {
     /**
      * Reopen a previously closed reader. Re-opened reader still keeps the original read offset.
      */
-    public void reopen(boolean forWrite, boolean emptyFile) throws IOException;
+    public void reopen() throws IOException;
 
     /**
-     * Close this reader and release any resources.
-     * <code>getReader</code> will still return this reader until the segment is closed.
+     * Close this reader and release any resources. {@link PBDSegment#getReader(String)} will still return this reader
+     * until the segment is closed.
      */
     public void close() throws IOException;
+
+    /**
+     * Similar to {@link #close()} but this reader will not be returned from {@link PBDSegment#getReader(String)}
+     */
+    public void purge() throws IOException;
 
     /**
      * Has this reader been closed.

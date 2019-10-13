@@ -1395,6 +1395,10 @@ public class Expression {
             return;
         }
 
+        if (e.opType == OpTypes.USER_DEFINED_AGGREGATE) {
+            return;
+        }
+
         if (stopAtTypeSet.contains(e.opType)) {
             return;
         }
@@ -1570,6 +1574,9 @@ public class Expression {
         prototypes.put(OpTypes.ALTERNATIVE,   (new VoltXMLElement("operation")).withValue("optype", "operator_alternative"));
         prototypes.put(OpTypes.ZONE_MODIFIER, null); // ???
         prototypes.put(OpTypes.MULTICOLUMN,   null); // an uninteresting!? ExpressionColumn case
+
+        // user defined aggregate function
+        prototypes.put(OpTypes.USER_DEFINED_AGGREGATE, (new VoltXMLElement("aggregation")).withValue("optype", "user_defined_aggregate"));
     }
 
     /**
@@ -1691,6 +1698,14 @@ public class Expression {
         exp = exp.duplicate();
         exp.attributes.put("id", getUniqueId(context.m_session));
 
+        if (opType == OpTypes.USER_DEFINED_AGGREGATE) {
+            if (this instanceof ExpressionAggregate) {
+                ExpressionAggregate tempExpr = (ExpressionAggregate) this;
+                exp.attributes.put("user_aggregate_id", Integer.toString(tempExpr.getUserAggregateId()));
+                exp.attributes.put("name", tempExpr.getName());
+            }
+        }
+
         if (realAlias != null) {
             exp.attributes.put("alias", realAlias);
         }
@@ -1774,6 +1789,13 @@ public class Expression {
         case OpTypes.SQL_FUNCTION:
             FunctionSQL fn = (FunctionSQL)this;
             return fn.voltAnnotateFunctionXML(exp);
+
+        case OpTypes.USER_DEFINED_AGGREGATE:
+            exp.attributes.put("valuetype", dataType.getNameString());
+            if (((ExpressionAggregate)this).isDistinctAggregate) {
+                throw Error.runtimeError(ErrorCode.X_UDAF01, "User-defined aggregate function does not support the 'distinct' keyword");
+            }
+            return exp;
 
         case OpTypes.COUNT:
         case OpTypes.SUM:
@@ -2031,7 +2053,7 @@ public class Expression {
 
     // A VoltDB extension to convert columnref expression for a column that is part of the USING clause
     // into a COALESCE expression
-    // columnref                    operation operator_case_when
+    //      columnref                   operation operator_case_when
     //      columnref T1.C      ->      operation is_null
     //      columnref T2.C                  columnref T1.C
     //                                  operation operator_alternative
@@ -2061,7 +2083,10 @@ public class Expression {
         exp.children.clear();
 
         // There should be at least 2 columnref expressions
-        assert(uniqueColumnrefs.size() > 1);
+        if (uniqueColumnrefs.size() < 2) {
+            throw Error.error(ErrorCode.X_42581, "Cannot distinguish column reference between two tables. "
+                    + "Use fully qualified names including the table name or alias to avoid ambiguous references");
+        }
         VoltXMLElement lastAlternativeExpr = null;
         VoltXMLElement resultColaesceExpr = null;
         while (true) {

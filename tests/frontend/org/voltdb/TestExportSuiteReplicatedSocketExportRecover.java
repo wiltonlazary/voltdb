@@ -23,8 +23,10 @@
 
 package org.voltdb;
 
-import java.io.File;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 
@@ -33,12 +35,14 @@ import org.junit.Test;
 import org.voltdb.FlakyTestRule.Flaky;
 import org.voltdb.client.Client;
 import org.voltdb.compiler.VoltProjectBuilder;
+import org.voltdb.compiler.deploymentfile.ServerExportEnum;
 import org.voltdb.export.ExportDataProcessor;
+import org.voltdb.export.ExportLocalClusterBase;
+import org.voltdb.export.SocketExportTestServer;
 import org.voltdb.export.TestExportBase;
 import org.voltdb.regressionsuites.LocalCluster;
 import org.voltdb.regressionsuites.MultiConfigSuiteBuilder;
 import org.voltdb.utils.MiscUtils;
-import org.voltdb.utils.VoltFile;
 
 /**
  * Listens for connections from socket export and then counts expected rows.
@@ -48,19 +52,18 @@ public class TestExportSuiteReplicatedSocketExportRecover extends TestExportBase
     @Rule
     public FlakyTestRule ftRule = new FlakyTestRule();
 
-    private static ServerListener m_serverSocket;
+    private static SocketExportTestServer m_serverSocket;
     private static LocalCluster config;
+    private static List<String> exStream = new ArrayList<>(Arrays.asList("ex"));
 
     @Override
     public void setUp() throws Exception
     {
         m_username = "default";
         m_password = "password";
-        VoltFile.recursivelyDelete(new File("/tmp/" + System.getProperty("user.name")));
-        File f = new File("/tmp/" + System.getProperty("user.name"));
-        f.mkdirs();
+        ExportLocalClusterBase.resetDir();
         super.setUp();
-        m_serverSocket = new ServerListener(5001);
+        m_serverSocket = new SocketExportTestServer(5001);
         m_serverSocket.start();
 
     }
@@ -69,7 +72,7 @@ public class TestExportSuiteReplicatedSocketExportRecover extends TestExportBase
     public void tearDown() throws Exception {
         super.tearDown();
         try {
-            m_serverSocket.close();
+            m_serverSocket.shutdown();
             m_serverSocket = null;
         } catch (Exception e) {}
     }
@@ -84,7 +87,7 @@ public class TestExportSuiteReplicatedSocketExportRecover extends TestExportBase
         Client client = getClient();
         Client adminClient = getAdminClient();
 
-        client.callProcedure("@AdHoc", "create stream ex export to target default (i bigint not null)");
+        client.callProcedure("@AdHoc", "create stream ex export to target socketconn (i bigint not null)");
         //We need a non export table
         client.callProcedure("@AdHoc", "create table ex2 (i bigint not null)");
         StringBuilder insertSql;
@@ -94,8 +97,8 @@ public class TestExportSuiteReplicatedSocketExportRecover extends TestExportBase
             client.callProcedure("@AdHoc", insertSql.toString());
         }
         client.drain();
-        waitForExportAllocatedMemoryZero(client);
-        verifyExportedTuples(1000);
+        waitForExportAllRowsDelivered(client, exStream);
+        m_serverSocket.verifyExportedTuples(1000);
         client.close();
         config.overrideStartCommandVerb("recover");
         if (MiscUtils.isPro()) {
@@ -113,8 +116,8 @@ public class TestExportSuiteReplicatedSocketExportRecover extends TestExportBase
             client.callProcedure("@AdHoc", insertSql.toString());
         }
         client.drain();
-        waitForExportAllocatedMemoryZero(client);
-        verifyExportedTuples(2000);
+        waitForExportAllRowsDelivered(client, exStream);
+        m_serverSocket.verifyExportedTuples(2000);
     }
 
     public TestExportSuiteReplicatedSocketExportRecover(final String name) {
@@ -136,12 +139,11 @@ public class TestExportSuiteReplicatedSocketExportRecover extends TestExportBase
         Properties props = new Properties();
         props.put("replicated", "true");
         props.put("skipinternals", "true");
-
-        project.addExport(true /* enabled */, "custom", props, "default");
+        project.addExport(true, ServerExportEnum.CUSTOM, props, "socketconn");
         /*
          * compile the catalog all tests start with
          */
-       config = new LocalCluster("export-ddl-cluster-rep.jar", 8, 3, 2,
+        config = new LocalCluster("export-ddl-cluster-rep.jar", 8, 3, 2,
                 BackendTarget.NATIVE_EE_JNI, LocalCluster.FailureState.ALL_RUNNING, true, additionalEnv);
         config.setHasLocalServer(false);
         if (MiscUtils.isPro()) {

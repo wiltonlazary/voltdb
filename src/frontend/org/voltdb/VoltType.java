@@ -545,7 +545,7 @@ public enum VoltType {
     }
 
     /** Support class to represent optional value length variability. */
-    private static final class LengthRange {
+    public static final class LengthRange {
         private final int m_min;
         private final int m_max;
         private final int m_default;
@@ -573,7 +573,7 @@ public enum VoltType {
         private static final int MAX_COLUMNS = 1024;
         private static final int MAX_ROW_SIZE = 1024 * 1024 * 2;
 
-        private static final int DEFAULT_COLUMN_SIZE = MAX_ROW_SIZE / MAX_COLUMNS;
+        public static final int DEFAULT_COLUMN_SIZE = MAX_ROW_SIZE / MAX_COLUMNS;
 
         int getMaxLengthInBytes() { return m_max; }
 
@@ -644,7 +644,7 @@ public enum VoltType {
     /**
      * Return the java class that is matched to the given value.
      *
-     * @param value
+     * @param value of a VoltType as returned by {@link #getValue()}
      * @return The java class.
      */
     public static Class<?> classFromByteValue(byte value) {
@@ -852,7 +852,7 @@ public enum VoltType {
     public boolean isUniqueIndexable() { return isNumber(); }
 
     /** Most VoltTypes are not compatible with an array-typed value.
-     * @see VARBINARY
+     * @see #VARBINARY
      * @param arrayArgClass a java array class like byte[] or String[]
      * @return false, unless overridden to enable a specific VoltType
      * (like VARBINARY) to support certain specific array types (like byte[]). */
@@ -943,8 +943,9 @@ public enum VoltType {
      * initialization */
     public boolean canExactlyRepresentAnyValueOf(VoltType otherType) {
         // self to self conversion is obviously fine.
-        if (this == otherType)
+        if (this == otherType) {
             return true;
+        }
 
         if (otherType.isBackendIntegerType()) {
             if (this.isBackendIntegerType()) {

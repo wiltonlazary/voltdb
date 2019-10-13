@@ -36,16 +36,17 @@ public:
     static const size_t TXN_RECORD_HEADER_SIZE = 1 + 8;
     //Type(1), parHash(4)
     static const size_t HASH_DELIMITER_SIZE = 1 + 4;
+    static const size_t DR_LOG_HEADER_SIZE = TXN_RECORD_HEADER_SIZE + HASH_DELIMITER_SIZE;
 
     // Also update DRProducerProtocol.java if version changes
     // whenever PROTOCOL_VERSION changes, check if DRBufferParser needs to be updated,
     // check if unit tests that use MockPartitionQueue and getTestDRBuffer() need to be updated
-    static const uint8_t PROTOCOL_VERSION = 8;
     static const uint8_t COMPATIBLE_PROTOCOL_VERSION = 7;
 
     static const uint8_t ELASTICADD_PROTOCOL_VERSION = 8;
+    static const uint8_t LATEST_PROTOCOL_VERSION = ELASTICADD_PROTOCOL_VERSION;
 
-    DRTupleStream(int partitionId, size_t defaultBufferSize, uint8_t drProtocolVersion=PROTOCOL_VERSION);
+    DRTupleStream(int partitionId, size_t defaultBufferSize, uint8_t drProtocolVersion=0);
 
     virtual ~DRTupleStream() {}
 
@@ -53,26 +54,20 @@ public:
      * write an insert or delete record to the stream
      * for active-active conflict detection purpose, write full row image for delete records.
      * */
-    virtual size_t appendTuple(char *tableHandle,
-                               int partitionColumn,
-                               int64_t spHandle,
-                               int64_t uniqueId,
-                               TableTuple &tuple,
-                               DRRecordType type);
+    virtual size_t appendTuple(char *tableHandle, int partitionColumn,
+            int64_t spHandle, int64_t uniqueId,
+            TableTuple &tuple, DRRecordType type);
 
     /**
      * write an update record to the stream
      * for active-active conflict detection purpose, write full before image for update records.
      * */
-    virtual size_t appendUpdateRecord(char *tableHandle,
-                                      int partitionColumn,
-                                      int64_t spHandle,
-                                      int64_t uniqueId,
-                                      TableTuple &oldTuple,
-                                      TableTuple &newTuple);
+    virtual size_t appendUpdateRecord(char *tableHandle, int partitionColumn,
+            int64_t spHandle, int64_t uniqueId,
+            TableTuple &oldTuple, TableTuple &newTuple);
 
     virtual size_t truncateTable(char *tableHandle,
-                                 std::string tableName,
+                                 std::string const& tableName,
                                  int partitionColumn,
                                  int64_t spHandle,
                                  int64_t uniqueId);
@@ -90,19 +85,14 @@ public:
         return DRCommittedInfo(m_committedSequenceNumber, m_lastCommittedSpUniqueId, m_lastCommittedMpUniqueId);
     }
 
-    virtual void generateDREvent(DREventType type, int64_t lastCommittedSpHandle, int64_t spHandle,
+    virtual void generateDREvent(DREventType type, int64_t spHandle,
                                  int64_t uniqueId, ByteArray catalogCommands);
 
-    static int32_t getTestDRBuffer(uint8_t drProtocolVersion,
-                                   int32_t partitionId,
-                                   std::vector<int32_t> partitionKeyValueList,
-                                   std::vector<int32_t> flagList,
-                                   long startSequenceNumber,
-                                   char *out);
+    static int getDRLogHeaderSize();
 
-    void setDrProtocolVersion(uint8_t drProtocolVersion) {
-            m_drProtocolVersion = drProtocolVersion;
-    }
+    static int32_t getTestDRBuffer(uint8_t drProtocolVersion, int32_t partitionId,
+            std::vector<int32_t> partitionKeyValueList, std::vector<int32_t> flagList,
+            long startSequenceNumber, char *out);
 
     const uint64_t getOpenUniqueIdForTest() const {
         return m_openUniqueId;
@@ -111,14 +101,10 @@ public:
 private:
     bool transactionChecks(int64_t spHandle, int64_t uniqueId);
 
-    void writeRowTuple(TableTuple& tuple,
-            size_t rowHeaderSz,
-            size_t rowMetadataSz,
+    void writeRowTuple(TableTuple& tuple, size_t rowHeaderSz, size_t rowMetadataSz,
             ExportSerializeOutput &io);
 
-    size_t computeOffsets(DRRecordType &type,
-            TableTuple &tuple,
-            size_t &rowHeaderSz,
+    size_t computeOffsets(DRRecordType &type, TableTuple &tuple, size_t &rowHeaderSz,
             size_t &rowMetadataSz);
 
     /**
@@ -151,13 +137,8 @@ private:
 class MockDRTupleStream : public DRTupleStream {
 public:
     MockDRTupleStream(int partitionId) : DRTupleStream(partitionId, 1024) {}
-    size_t appendTuple(char *tableHandle,
-                       int partitionColumn,
-                       int64_t spHandle,
-                       int64_t uniqueId,
-                       TableTuple &tuple,
-                       DRRecordType type)
-    {
+    size_t appendTuple(char *tableHandle, int partitionColumn, int64_t spHandle,
+                       int64_t uniqueId, TableTuple &tuple, DRRecordType type) {
         return 0;
     }
 
@@ -166,12 +147,8 @@ public:
 
     void rollbackDrTo(size_t mark, size_t drRowCost) {}
 
-    size_t truncateTable(char *tableHandle,
-                         std::string tableName,
-                         int partitionColumn,
-                         int64_t spHandle,
-                         int64_t uniqueId)
-    {
+    size_t truncateTable(char *tableHandle, std::string const& tableName,
+                         int partitionColumn, int64_t spHandle, int64_t uniqueId) {
         return 0;
     }
 };

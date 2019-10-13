@@ -116,19 +116,45 @@ public class SQLParser extends SQLPatternFactory
         ).compile("PAT_PARTITION_TABLE");
 
     /**
-     * Pattern: CREATE TABLE tablename
-     *
+     * Pattern: CREATE TABLE table_name [EXPORT TO target migrate_target_name [ON...]].
      *
      * Capture groups:
      *  (1) table name
+     *  (2) target name
+     *  (3) [triggers, comma separated]
+     */
+    private static final Pattern PAT_CREATE_EXPORT_TABLE =
+            SPF.statement(
+                    SPF.token("create"), SPF.token("table"),
+                    SPF.capture("tableName", SPF.databaseObjectName()),
+                    SPF.token("export"), SPF.token("to"), SPF.token("target"),
+                    SPF.capture("migrateTargetName", SPF.databaseObjectName()),
+                    SPF.optional(SPF.clause(
+                            SPF.token("on"),
+                            SPF.group(true, SPF.commaList(SPF.userName())))),
+                    new SQLPatternPartString("\\s*"),
+                    SPF.anyColumnFields().withFlags(ADD_LEADING_SPACE_TO_CHILD),
+                    SPF.anythingOrNothing().withFlags(ADD_LEADING_SPACE_TO_CHILD)
+            ).compile("PAT_CREATE_EXPORT_TABLE");
+
+    /**
+     * Pattern: CREATE TABLE table_name [MIGRATE TO target migrate_target_name].
+     *
+     * Capture groups:
+     *  (1) table name
+     *  [(2) target name]
      */
     private static final Pattern PAT_CREATE_TABLE =
-        SPF.statement(
-            SPF.token("create"), SPF.token("table"), SPF.capture("name", SPF.databaseObjectName()),
-            new SQLPatternPartString("\\s*"),
-            SPF.anyColumnFields().withFlags(ADD_LEADING_SPACE_TO_CHILD),
-            SPF.anythingOrNothing()
-        ).compile("PAT_CREATE_TABLE");
+            SPF.statement(
+                    SPF.token("create"), SPF.token("table"),
+                    SPF.capture("tableName", SPF.databaseObjectName()),
+                    SPF.optional(SPF.clause(SPF.token("migrate"), SPF.token("to"),
+                            SPF.token("target"),
+                            SPF.capture("migrateTargetName", SPF.databaseObjectName()))),
+                    new SQLPatternPartString("\\s*"), // see ENG-11862 for reason about adding this pattern
+                    SPF.anyColumnFields().withFlags(ADD_LEADING_SPACE_TO_CHILD),
+                    SPF.anythingOrNothing().withFlags(ADD_LEADING_SPACE_TO_CHILD)
+            ).compile("PAT_CREATE_TABLE");
 
     /**
      * Pattern: CREATE TABLE tablename
@@ -239,6 +265,37 @@ public class SQLParser extends SQLPatternFactory
         ).compile("PAT_CREATE_FUNCTION_FROM_METHOD");
 
     /*
+     * CREATE AGGREGATE FUNCTION <NAME> FROM CLASS <CLASS NAME>
+     *
+     * CREATE AGGREGATE FUNCTION with the designated method from the given class.
+     *
+     * Capture groups:
+     *  (1) Function name
+     *  (2) The class name
+     */
+    private static final Pattern PAT_CREATE_AGGREGATE_FUNCTION_FROM_CLASS =
+        SPF.statement(
+            SPF.token("create"), SPF.token("aggregate"), SPF.token("function"),
+            SPF.capture(SPF.functionName()), SPF.token("from"), SPF.token("class"),
+            SPF.capture(SPF.classPath())
+        ).compile("PAT_CREATE_AGGREGATE_FUNCTION_FROM_CLASS");
+
+    /*
+     * DROP AGGREGATE FUNCTION <NAME> [IF EXISTS]
+     *
+     * Drop a user-defined aggregate function.
+     *
+     * Capture groups:
+     *  (1) Function name
+     *  (2) If exists
+     */
+    private static final Pattern PAT_DROP_AGGREGATE_FUNCTION =
+        SPF.statement(
+            SPF.token("drop"), SPF.token("aggregate"), SPF.token("function"), SPF.capture(SPF.functionName()),
+            SPF.optional(SPF.capture(SPF.clause(SPF.token("if"), SPF.token("exists"))))
+        ).compile("PAT_DROP_AGGREGATE_FUNCTION");
+
+    /*
      * DROP FUNCTION <NAME> [IF EXISTS]
      *
      * Drop a user-defined function.
@@ -249,8 +306,7 @@ public class SQLParser extends SQLPatternFactory
      */
     private static final Pattern PAT_DROP_FUNCTION =
         SPF.statement(
-            SPF.token("drop"), SPF.token("function"), SPF.capture(SPF.functionName()),
-            SPF.optional(SPF.capture(SPF.clause(SPF.token("if"), SPF.token("exists"))))
+            SPF.token("drop"), SPF.token("function"), SPF.capture(SPF.functionName()), SPF.ifExisits()
         ).compile("PAT_DROP_FUNCTION");
 
     /*
@@ -363,6 +419,113 @@ public class SQLParser extends SQLPatternFactory
                     ).compile("PAT_DROP_STREAM");
 
     /**
+     * Build regex to support create task statement in the from of
+     * <p>
+     *
+     * <pre>
+     * CREATE TASK {name}
+     *     {
+     *         {
+     *             ON SCHEDULE {
+     *                 DELAY {interval} {unit} |
+     *                 EVERY {interval} {unit} |
+     *                 CRON {exp} |
+     *                 FROM CLASS {class} [WITH {args}]
+     *             }
+     *             PROCEDURE {{name} | FROM CLASS {class}} [WITH {args}]
+     *         } |
+     *         FROM CLASS {class} [WITH {args}]
+     *     }
+     *     [ ON ERROR { STOP | CONTINUE | IGNORE } ]
+     *     [ RUN ON { DATABASE | HOSTS | PARTITIONS } ]
+     *     [ AS USER {user-name} ]
+     *     [ ENABLE | DISABLE ]
+     * </pre>
+     */
+    private static final Pattern PAT_CREATE_TASK =
+            SPF.statement(
+                SPF.token("create"), SPF.token("task"), SPF.capture("name", SPF.databaseObjectName()),
+                SPF.oneOf(
+                    SPF.clause(SPF.token("from"), SPF.token("class"), SPF.capture("class", SPF.className())),
+                    SPF.clause(
+                        SPF.token("on"), SPF.token("SCHEDULE"),
+                        SPF.oneOf(
+                            SPF.clause(
+                                SPF.capture("intervalSchedule", SPF.oneOf("delay", "every")),
+                                SPF.capture("interval", SPF.integer()),
+                                SPF.capture("timeUnit", SPF.oneOf("milliseconds", "seconds", "minutes", "hours", "days"))
+                            ),
+                            SPF.clause(SPF.token("cron"),
+                                SPF.capture("cron",
+                                    SPF.clause(SPF.token("[0-9\\*\\-,/]+").withFlags(ADD_LEADING_SPACE_TO_CHILD),
+                                    SPF.repeat(5, 5, SPF.token("[\\w\\*\\?\\-,/#]+"))).withFlags(ADD_LEADING_SPACE_TO_CHILD)
+                                )
+                            ),
+                            SPF.clause(
+                                SPF.token("from"), SPF.token("class"), SPF.capture("scheduleClass", SPF.className()),
+                                SPF.optional(
+                                    SPF.clause(
+                                        SPF.token("with"), SPF.token("\\(\\s*"),
+                                        SPF.capture("scheduleParameters", SPF.commaList(SPF.token(".+"))).withFlags(ADD_LEADING_SPACE_TO_CHILD),
+                                        SPF.token("\\s*\\)").withFlags(ADD_LEADING_SPACE_TO_CHILD)
+                                    )
+                                )
+                            )
+                        ),
+                        SPF.token("procedure"),
+                        SPF.oneOf(
+                            SPF.capture("procedure", SPF.token("@?[\\w.$]+")),
+                            SPF.clause(
+                                SPF.token("from"), SPF.token("class"), SPF.capture("generatorClass", SPF.className())
+                            )
+                        )
+                    )
+                ),
+                SPF.optional(
+                    SPF.clause(
+                        SPF.token("with"), SPF.token("\\(\\s*"),
+                        SPF.capture("parameters", SPF.commaList(SPF.token(".+"))).withFlags(ADD_LEADING_SPACE_TO_CHILD),
+                        SPF.token("\\s*\\)").withFlags(ADD_LEADING_SPACE_TO_CHILD)
+                    )
+                ),
+                SPF.optional(SPF.clause(SPF.token("on"), SPF.token("error"),
+                    SPF.capture("onError", SPF.oneOf(SPF.token("stop"), SPF.token("log"), SPF.token("ignore"))))),
+                SPF.optional(SPF.clause(SPF.token("run"), SPF.token("on"),
+                    SPF.capture("scope", SPF.oneOf("database", "hosts", "partitions")))),
+                SPF.optional(SPF.clause(SPF.token("as"), SPF.token("user"), SPF.capture("asUser", SPF.userName()))),
+                SPF.optional(SPF.oneOf(SPF.capture("disabled", SPF.token("disable")), SPF.token("enable")))
+            ).compile("PAT_CREATE_TASK");
+
+    /**
+     * Build regex to support drop task statement in the from of
+     * <p>
+     * <code>
+     * DROP TASK <task name> [IF EXISTS]
+     * </code>
+     */
+    private static final Pattern PAT_DROP_TASK =
+            SPF.statement(
+                    SPF.token("drop"), SPF.token("task"), SPF.capture("name", SPF.databaseObjectName()),
+                    SPF.ifExisits())
+            .compile("PAT_DROP_TASK");
+
+    /**
+     * Build regex to support alter task statement in the from of
+     * <p>
+     * <code>
+     * ALTER TASK <task name> [(ENABLE | DISABLE)]
+     * </code>
+     */
+    private static final Pattern PAT_ALTER_TASK =
+            SPF.statement(
+                SPF.token("alter"), SPF.token("task"), SPF.capture("name", SPF.databaseObjectName()),
+                    SPF.optional(SPF.capture("action", SPF.oneOf("enable", "disable"))),
+                    SPF.optional(SPF.clause(SPF.token("on"), SPF.token("error"),
+                            SPF.capture("onError",
+                                    SPF.oneOf(SPF.token("stop"), SPF.token("log"), SPF.token("ignore")))))
+            ).compile("PAT_ALTER_TASK");
+
+    /**
      * NB supports only unquoted table names
      * Captures 1 group, the table name.
      */
@@ -399,12 +562,12 @@ public class SQLParser extends SQLPatternFactory
 
     /**
      *  If the statement starts with a VoltDB-specific DDL command,
-     *  one of create procedure, create role, drop procedure, drop role,
-     *  partition, replicate, export, import, or dr, the one match group
-     *  is set to the matching command EXCEPT as special (needlessly obscure)
-     *  cases, simply returns only "procedure" for "create procedure",
-     *  only "role" for "create role", and only "drop" for either
-     * "drop procedure" OR "drop role".
+     *  one of create procedure, create role, create function, create aggregate function,
+     *  drop procedure, drop role, partition, replicate, export, import, or dr,
+     *  the one match group is set to the matching command EXCEPT as special
+     *  (needlessly obscure) cases, simply returns only "procedure" for "create
+     *  procedure", only "role" for "create role", only "aggregate" for "create aggregate
+     *  function" and only "drop" for either "drop procedure" OR "drop role".
      *  ALSO (less than helpfully) returns "drop" for non-VoltDB-specific
      *  "drop" commands like "drop table".
      *  TODO: post-processing would be much simpler if this pattern reliably
@@ -419,14 +582,15 @@ public class SQLParser extends SQLPatternFactory
             // <= means zero-width positive lookbehind.
             // This means that the "CREATE\\s{}" is required to match but is not part of the capture.
             "(?<=\\ACREATE\\s{0,1024})" +          //TODO: 0 min whitespace should be 1?
-            "(?:PROCEDURE|ROLE|FUNCTION)|" +                // token options after CREATE
+            "(?:PROCEDURE|ROLE|FUNCTION|TASK|AGGREGATE)|" + // token options after CREATE
             // the rest are stand-alone token options
             "\\ADROP|" +
             "\\APARTITION|" +
             "\\AREPLICATE|" +
             "\\AIMPORT|" +
             "\\ADR|" +
-            "\\ASET" +
+            "\\ASET|" +
+            "\\AALTER\\s+TASK" +
             ")" +                                  // end (group 1)
             "\\s" +                                // one required whitespace to terminate keyword
             "");
@@ -593,6 +757,19 @@ public class SQLParser extends SQLPatternFactory
             "\\s*;?\\s*",   // an optional semicolon surrounded by whitespace
             Pattern.CASE_INSENSITIVE);
 
+    // QUERYSTATS is followed by a SQL query. Capture group 2 is the query.
+    private static final Pattern QueryStatsToken = Pattern.compile(
+            "^\\s*" +         // optional indent at start of line
+            "querystats" +          // required QUERYSTATS command token
+            "(\\W|$)" +       // require an end to the keyword OR EOL (group 1)
+            // Make everything that follows optional so that help
+            // command diagnostics can "own" any line starting with the word
+            // help.
+            "\\s*" +          // optional whitespace before subcommand
+            "([^;\\s]*)" +    // optional subcommand (group 2)
+            InitiallyForgivingDirectiveTermination,
+            Pattern.CASE_INSENSITIVE);
+
     // Query Execution
     private static final Pattern ExecuteCallPreamble = Pattern.compile(
             "^\\s*" +            // optional indent at start of line
@@ -737,9 +914,22 @@ public class SQLParser extends SQLPatternFactory
         return PAT_CREATE_STREAM.matcher(statement);
     }
 
-    public static Matcher matchCreateTable(String statement)
-    {
+    /**
+     * Match statement against create table ... migrate to target ... pattern.
+     * @param statement statement to match against
+     * @return          pattern matcher object
+     */
+    public static Matcher matchCreateTableMigrateTo(String statement) {
         return PAT_CREATE_TABLE.matcher(statement);
+    }
+
+    /**
+     * Match statement against create table ... export to target ... pattern.
+     * @param statement statement to match against
+     * @return          pattern matcher object
+     */
+    public static Matcher matchCreateTableExportTo(String statement) {
+        return PAT_CREATE_EXPORT_TABLE.matcher(statement);
     }
 
     public static Matcher matchAlterTTL(String statement)
@@ -843,6 +1033,26 @@ public class SQLParser extends SQLPatternFactory
     }
 
     /**
+     * Match statement against the pattern for create aggregate function from class
+     * @param statement  statement to match against
+     * @return           pattern matcher object
+     */
+    public static Matcher matchCreateAggregateFunctionFromClass(String statement)
+    {
+        return PAT_CREATE_AGGREGATE_FUNCTION_FROM_CLASS.matcher(statement);
+    }
+
+    /**
+     * Match statement against the pattern for drop aggregate function
+     * @param statement  statement to match against
+     * @return           pattern matcher object
+     */
+    public static Matcher matchDropAggregateFunction(String statement)
+    {
+        return PAT_DROP_AGGREGATE_FUNCTION.matcher(statement);
+    }
+
+    /**
      * Match statement against the pattern for drop function
      * @param statement  statement to match against
      * @return           pattern matcher object
@@ -893,6 +1103,142 @@ public class SQLParser extends SQLPatternFactory
     }
 
     /**
+     * Match statement against pattern for create task
+     * <p>
+     * If a match is found the following named groups are in the returned {@link Matcher}:
+     * <table>
+     * <tr>
+     * <th>Capture name</th>
+     * <th>Presence</th>
+     * <th>Description</th>
+     * </tr>
+     * <tr>
+     * <td>name</td>
+     * <td>Required</td>
+     * <td>Name of task</td>
+     * </tr>
+     * <tr>
+     * <td>class|intervalSchedule|cron|scheduleClass</td>
+     * <td>Required</td>
+     * <td>Scheduler class, fixed delay, every or cron expression to be used</td>
+     * </tr>
+     * <tr>
+     * <td>interval</td>
+     * <td>Required for delay and every</td>
+     * <td>Interval of time for scheduling</td>
+     * </tr>
+     * <tr>
+     * <td>timeUnit</td>
+     * <td>Required for delay and every</td>
+     * <td>Time unit of the interval</td>
+     * </tr>
+     * <tr>
+     * <td>scheduleParameters</td>
+     * <td>Optional</td>
+     * <td>Parameters to pass to the scheduleClass</td>
+     * </tr>
+     * <tr>
+     * <td>procedure|generatorClass</td>
+     * <td>Required for cron, delay, every or scheduleClass</td>
+     * <td>Procedure name with comma separated list of parameters to pass to the procedure</td>
+     * </tr>
+     * <tr>
+     * <td>parameters</td>
+     * <td>Optional</td>
+     * <td>Comma separated list of parameters to pass to the scheduler, procedure or generator</td>
+     * </tr>
+     * <tr>
+     * <td>onError</td>
+     * <td>Optional</td>
+     * <td>How error responses from a procedure should be handled</td>
+     * </tr>
+     * <tr>
+     * <td>scope</td>
+     * <td>Optional</td>
+     * <td>Scope of the task. IE database, hosts, partitions</td>
+     * </tr>
+     * <tr>
+     * <td>asUser</td>
+     * <td>Optional</td>
+     * <td>Which user to use to execute the procedures run by the scheduler</td>
+     * </tr>
+     * <td>disabled</td>
+     * <td>Optional</td>
+     * <td>If present this task is part of the catalog but not executed</td>
+     * </tr>
+     * </table>
+     *
+     * @param statement statement to match against
+     * @return pattern matcher object
+     */
+    public static Matcher matchCreateTask(String statement) {
+        return PAT_CREATE_TASK.matcher(statement);
+    }
+
+    /**
+     * Match statement against pattern for drop task
+     * <p>
+     * If a match is found the following named groups are in the returned {@link Matcher}:
+     * <table>
+     * <tr>
+     * <th>Capture name</th>
+     * <th>Presence</th>
+     * <th>Description</th>
+     * </tr>
+     * <tr>
+     * <td>name</td>
+     * <td>Required</td>
+     * <td>Name of task</td>
+     * </tr>
+     * <tr>
+     * <td>ifExists</td>
+     * <td>Optional</td>
+     * <td>If present then it is not an error if the task does not exist</td>
+     * </tr>
+     * </table>
+     *
+     * @param statement statement to match against
+     * @return pattern matcher object
+     */
+    public static Matcher matchDropTask(String statement) {
+        return PAT_DROP_TASK.matcher(statement);
+    }
+
+    /**
+     * Match statement against pattern for alter task
+     * <p>
+     * If a match is found the following named groups are in the returned {@link Matcher}:
+     * <table>
+     * <tr>
+     * <th>Capture name</th>
+     * <th>Presence</th>
+     * <th>Description</th>
+     * </tr>
+     * <tr>
+     * <td>name</td>
+     * <td>Required</td>
+     * <td>Name of task</td>
+     * </tr>
+     * <tr>
+     * <td>action</td>
+     * <td>Required</td>
+     * <td>What alter action should be performed. Enable or disable</td>
+     * </tr>
+     * <tr>
+     * <td>onError</td>
+     * <td>Optional</td>
+     * <td>How error responses from a procedure should be handled</td>
+     * </tr>
+     * </table>
+     *
+     * @param statement statement to match against
+     * @return pattern matcher object
+     */
+    public static Matcher matchAlterTask(String statement) {
+        return PAT_ALTER_TASK.matcher(statement);
+    }
+
+    /**
      * Build a pattern segment to accept a single optional ALLOW or PARTITION clause
      * to modify CREATE PROCEDURE statements.
      *
@@ -901,9 +1247,13 @@ public class SQLParser extends SQLPatternFactory
      *
      * Capture groups (when captureTokens is true):
      *  (1) ALLOW clause: entire role list with commas and internal whitespace
-     *  (2) PARTITION clause: procedure name
-     *  (3) PARTITION clause: table name
-     *  (4) PARTITION clause: column name
+     *  (2) PARTITION clause: table name
+     *  (3) PARTITION clause: column name
+     *  (4) PARTITION clause: parameter number
+     *  (5) PARTITION clause: table name 2
+     *  (6) PARTITION clause: column name 2
+     *  (7) PARTITION clause: parameter number 2
+     *  (8) DIRECTED clause for directed procedures
      */
     private static SQLPatternPart makeInnerProcedureModifierClausePattern(boolean captureTokens)
     {
@@ -939,7 +1289,8 @@ public class SQLParser extends SQLPatternFactory
                             )
                         )
                      )
-                )
+                ),
+                SPF.group(captureTokens, SPF.token("directed"))
             );
     }
 
@@ -2019,8 +2370,9 @@ public class SQLParser extends SQLPatternFactory
                     continue;
                 }
                 line = line.trim();
-                if (line.equals(""))
+                if (line.equals("")) {
                     continue;
+                }
 
                 // we have a non-blank line that contains more than just a comment.
                 return queryIsDDL(line);
@@ -2080,6 +2432,33 @@ public class SQLParser extends SQLPatternFactory
      */
     public static String parseDescribeStatement(String statement) {
         Matcher matcher = DescribeToken.matcher(statement);
+        if (matcher.matches()) {
+            String commandWordTerminator = matcher.group(1);
+            if (OneWhitespace.matcher(commandWordTerminator).matches()) {
+                String trailings = matcher.group(3) + ";" + matcher.group(4);
+                // In a valid command, both "trailings" groups should be empty.
+                if (trailings.equals(";")) {
+                    // Return the subcommand keyword -- possibly a valid one.
+                    return matcher.group(2);
+                }
+                // For an invalid form of the command,
+                // return an approximation of the garbage input.
+                return matcher.group(2) + " " + trailings;
+            }
+            if (commandWordTerminator.equals("") || commandWordTerminator.equals(";")) {
+                return commandWordTerminator; // EOL or ; reached before subcommand
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Parse QUERYSTATS statement for sqlcmd.
+     * @param statement  statement to parse
+     * @return           String containing full SQL query
+     */
+    public static String parseQueryStatsStatement(String statement) {
+        Matcher matcher = QueryStatsToken.matcher(statement);
         if (matcher.matches()) {
             String commandWordTerminator = matcher.group(1);
             if (OneWhitespace.matcher(commandWordTerminator).matches()) {

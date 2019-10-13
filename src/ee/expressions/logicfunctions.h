@@ -22,7 +22,7 @@ namespace voltdb {
 /** implement the 2n/2n+1-argument DECODE function */
 template<> inline NValue NValue::call<FUNC_DECODE>(const std::vector<NValue>& arguments) {
     int size = static_cast <int> (arguments.size());
-    assert(size >=3);
+    vassert(size >=3);
     int loopnum = ( size - 1 )/2;
     const NValue& baseval = arguments[0];
     for ( int i = 0; i < loopnum; i++ ) {
@@ -44,11 +44,11 @@ template<> inline NValue NValue::call<FUNC_DECODE>(const std::vector<NValue>& ar
 }
 
 /*
-* Implement the Volt NOT_MIGRATED function.
-* Returns true if the hidden column is NULL, which means that it
-* has not been migrated.
+* Implement the Volt MIGRATING function.
+* Returns true if the hidden column is NOT NULL, which means that the
+* migrating process for this row has been started.
 */
-template<> inline NValue NValue::callUnary<FUNC_VOLT_NOT_MIGRATED>() const {
-    return ValueFactory::getBooleanValue(isNull());
+template<> inline NValue NValue::callUnary<FUNC_VOLT_MIGRATING>() const {
+    return ValueFactory::getBooleanValue(! isNull());
 }
 }

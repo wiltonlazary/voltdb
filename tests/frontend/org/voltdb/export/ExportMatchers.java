@@ -43,10 +43,11 @@ public class ExportMatchers {
     public static final Matcher<VoltMessage> ackMbxMessageIs(
             final int partitionId,
             final String signature,
-            final long uso) {
+            final long seqNo,
+            final long generationId) {
         return new TypeSafeMatcher<VoltMessage>() {
             Matcher<BinaryPayloadMessage> payloadMatcher =
-                    ackPayloadIs(partitionId, signature, uso);
+                    ackPayloadIs(partitionId, signature, seqNo, generationId);
             @Override
             public void describeTo(Description d) {
                 d.appendDescriptionOf(payloadMatcher);
@@ -61,17 +62,19 @@ public class ExportMatchers {
     public static final Matcher<BinaryPayloadMessage> ackPayloadIs(
             final int partitionId,
             final String signature,
-            final long seqNo) {
+            final long seqNo,
+            final long generationId) {
 
         return new TypeSafeMatcher<BinaryPayloadMessage>() {
             Matcher<AckPayloadMessage> payloadMatcher =
-                    ackMessageIs(partitionId, signature, seqNo);
+                    ackMessageIs(partitionId, signature, seqNo, generationId);
             @Override
             public void describeTo(Description d) {
                 d.appendText("BinaryPayloadMessage [ partitionId: ")
                 .appendValue(partitionId).appendText(", seqNo: ")
                 .appendValue(seqNo).appendText(", signature: ")
-                .appendValue(signature).appendText("]");
+                .appendValue(signature).appendText(", generationId: ")
+                .appendValue(generationId).appendText("]");
             }
             @Override
             protected boolean matchesSafely(BinaryPayloadMessage p) {
@@ -90,7 +93,8 @@ public class ExportMatchers {
     static final Matcher<AckPayloadMessage> ackMessageIs(
             final int partitionId,
             final String signature,
-            final long seqNo) {
+            final long seqNo,
+            final long generationId) {
 
         return new TypeSafeMatcher<AckPayloadMessage>() {
             @Override
@@ -98,13 +102,15 @@ public class ExportMatchers {
                 d.appendText("AckPayloadMessage [ partitionId: ")
                 .appendValue(partitionId).appendText(", seqNo: ")
                 .appendValue(seqNo).appendText(", signature: ")
-                .appendValue(signature).appendText("]");
+                .appendValue(signature).appendText(", generationId: ")
+                .appendValue(generationId).appendText("]");
             }
             @Override
             protected boolean matchesSafely(AckPayloadMessage m) {
                 return equalTo(partitionId).matches(m.getPartitionId())
                         && equalTo(signature).matches(m.getSignature())
-                        && equalTo(seqNo).matches(m.getSequenceNumber());
+                        && equalTo(seqNo).matches(m.getSequenceNumber())
+                        && equalTo(generationId).matches((m.getGenerationId()));
             }
         };
     }
@@ -113,6 +119,7 @@ public class ExportMatchers {
         int partitionId;
         String signature;
         long seqNo;
+        long generationId;
 
         AckPayloadMessage(BinaryPayloadMessage p) {
             ByteBuffer buf = ByteBuffer.wrap(p.m_payload);
@@ -126,15 +133,17 @@ public class ExportMatchers {
             signature = new String( pSignatureBytes, Constants.UTF8ENCODING);
 
             seqNo = buf.getLong();
+            generationId = buf.getLong();
         }
 
-        AckPayloadMessage(int partitionId, String signature, long seqNo) {
+        AckPayloadMessage(int partitionId, String signature, long seqNo, long generationId) {
             Preconditions.checkArgument(signature != null && ! signature.trim().isEmpty());
             Preconditions.checkArgument(seqNo >= 0);
 
             this.partitionId = partitionId;
             this.signature = signature;
             this.seqNo = seqNo;
+            this.generationId = generationId;
         }
 
         int getPartitionId() {
@@ -149,14 +158,20 @@ public class ExportMatchers {
             return seqNo;
         }
 
+        long getGenerationId() {
+            return generationId;
+        }
+
         VoltMessage asVoltMessage() {
             byte [] signatureBytes = signature.getBytes(Constants.UTF8ENCODING);
-            ByteBuffer buf = ByteBuffer.allocate(17 + signatureBytes.length);
+            final int msgLen = 1 + 4 + 4 + signatureBytes.length + 8 + 8;
+            ByteBuffer buf = ByteBuffer.allocate(msgLen);
             buf.put((byte)ExportManager.RELEASE_BUFFER);
             buf.putInt(partitionId);
             buf.putInt(signatureBytes.length);
             buf.put(signatureBytes);
             buf.putLong(seqNo);
+            buf.putLong(generationId);
 
             return new BinaryPayloadMessage(new byte[0], buf.array());
         }
@@ -169,6 +184,7 @@ public class ExportMatchers {
             result = prime * result
                     + ((signature == null) ? 0 : signature.hashCode());
             result = prime * result + (int) (seqNo ^ (seqNo >>> 32));
+            result = prime * result + (int) (generationId ^ (generationId >>> 32));
             return result;
         }
 
@@ -190,13 +206,16 @@ public class ExportMatchers {
                 return false;
             if (seqNo != other.seqNo)
                 return false;
+            if (generationId != other.generationId)
+                return false;
             return true;
         }
 
         @Override
         public String toString() {
             return "AckPayloadMessage [partitionId=" + partitionId
-                    + ", signature=" + signature + ", seqNo=" + seqNo + "]";
+                    + ", signature=" + signature + ", seqNo=" + seqNo
+                    + ", generationId=" + generationId + "]";
         }
     }
 }

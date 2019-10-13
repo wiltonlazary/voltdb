@@ -53,39 +53,21 @@
 
 namespace voltdb {
 
-const uint64_t TableTupleFilter::INVALID_INDEX = std::numeric_limits<uint64_t>::max();
-
-
-TableTupleFilter::TableTupleFilter() :
-    m_tuples(),
-    m_blocks(),
-    m_blockIndexes(),
-    m_tuplesPerBlock(),
-    m_tupleLength(),
-    m_prevBlockAddress(std::numeric_limits<uint64_t>::max()),
-    m_prevBlockIndex(std::numeric_limits<uint64_t>::max()),
-    m_lastActiveTupleIndex(std::numeric_limits<uint64_t>::max())
-    {}
-
-void TableTupleFilter::init(const std::vector<uint64_t>& blocks, uint32_t tuplesPerBlock, uint32_t tupleLength)
-{
-    m_tuples.insert(m_tuples.end(), blocks.size() * tuplesPerBlock, TableTupleFilter::INACTIVE_TUPLE);
+void TableTupleFilter::init(const std::vector<uint64_t>& blocks, uint32_t tuplesPerBlock, uint32_t tupleLength) {
+    m_tuples.insert(m_tuples.end(), blocks.size() * tuplesPerBlock, INACTIVE_TUPLE);
     m_blocks.insert(m_blocks.end(), blocks.begin(), blocks.end());
     m_tuplesPerBlock = tuplesPerBlock;
     m_tupleLength = tupleLength;
     std::sort(m_blocks.begin(), m_blocks.end());
     m_blockIndexes.rehash(m_blocks.size());
     for(size_t i = 0; i < m_blocks.size(); ++i) {
-        m_blockIndexes.insert(std::make_pair(m_blocks[i], i * m_tuplesPerBlock));
+        m_blockIndexes.emplace(m_blocks[i], i * m_tuplesPerBlock);
     }
 }
 
-void TableTupleFilter::init(Table* table)
-{
-    assert(table != NULL);
-
+void TableTupleFilter::init(Table* table) {
+    vassert(table != nullptr);
     init(table->getBlockAddresses(), table->getTuplesPerBlock(), table->getTupleLength());
-
     TableTuple tuple(table->schema());
     TableIterator iterator = table->iterator();
     while (iterator.next(tuple)) {
@@ -93,25 +75,22 @@ void TableTupleFilter::init(Table* table)
     }
 }
 
-uint64_t TableTupleFilter::findBlockIndex(uint64_t tupleAddress)
-{
+uint64_t TableTupleFilter::findBlockIndex(uint64_t tupleAddress) {
     if (m_prevBlockAddress > tupleAddress || (tupleAddress - m_prevBlockAddress)/ m_tupleLength >= m_tuplesPerBlock) {
         // This tuple belongs to a different block that the last tuple did
-        assert(!m_blocks.empty());
-        std::vector<uint64_t>::iterator blockIter = std::lower_bound(m_blocks.begin(), m_blocks.end(), tupleAddress);
-        if (blockIter == m_blocks.end() || tupleAddress != *blockIter)
-        {
+        vassert(!m_blocks.empty());
+        auto blockIter = std::lower_bound(m_blocks.begin(), m_blocks.end(), tupleAddress);
+        if (blockIter == m_blocks.end() || tupleAddress != *blockIter) {
             // move back a block
-            assert(blockIter != m_blocks.begin());
+            vassert(blockIter != m_blocks.begin());
             --blockIter;
         }
         m_prevBlockAddress = *blockIter;
-        assert(m_blockIndexes.find(m_prevBlockAddress) != m_blockIndexes.end());
+        vassert(m_blockIndexes.find(m_prevBlockAddress) != m_blockIndexes.end());
         m_prevBlockIndex = m_blockIndexes.find(m_prevBlockAddress)->second;
     }
     return m_prevBlockIndex;
 }
-
 
 }
 

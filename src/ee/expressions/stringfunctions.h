@@ -15,8 +15,7 @@
  * along with VoltDB.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef STRINGFUNCTIONS_H
-#define STRINGFUNCTIONS_H
+#pragma once
 
 #include "common/ThreadLocalPool.h" // for POOLED_MAX_VALUE_LENGTH
 
@@ -27,7 +26,7 @@
 #define PCRE2_CODE_UNIT_WIDTH 8
 #include <string.h>
 #include <boost/shared_ptr.hpp>
-#include "pcre2.h"
+#include <pcre2.h>
 
 #include <iostream>
 #include <sstream>
@@ -41,10 +40,10 @@ namespace voltdb {
 /** implement the 1-argument SQL OCTET_LENGTH function */
 template<> inline NValue NValue::callUnary<FUNC_OCTET_LENGTH>() const {
     if (isNull()) {
-        return getNullValue(VALUE_TYPE_INTEGER);
+        return getNullValue(ValueType::tINTEGER);
     }
     int32_t length;
-    getObject_withoutNull(&length);
+    getObject_withoutNull(length);
     return getIntegerValue(length);
 }
 
@@ -63,11 +62,11 @@ template<> inline NValue NValue::callUnary<FUNC_CHAR>() const {
 /** implement the 1-argument SQL CHAR_LENGTH function */
 template<> inline NValue NValue::callUnary<FUNC_CHAR_LENGTH>() const {
     if (isNull()) {
-        return getNullValue(VALUE_TYPE_BIGINT);
+        return getNullValue(ValueType::tBIGINT);
     }
 
     int32_t lenValue;
-    const char* valueChars = getObject_withoutNull(&lenValue);
+    const char* valueChars = getObject_withoutNull(lenValue);
     return getBigIntValue(static_cast<int64_t>(getCharLength(valueChars, lenValue)));
 }
 
@@ -99,12 +98,12 @@ template<> inline NValue NValue::callUnary<FUNC_FOLD_LOWER>() const {
         return getNullStringValue();
     }
 
-    if (getValueType() != VALUE_TYPE_VARCHAR) {
-        throwCastSQLException (getValueType(), VALUE_TYPE_VARCHAR);
+    if (getValueType() != ValueType::tVARCHAR) {
+        throwCastSQLException (getValueType(), ValueType::tVARCHAR);
     }
 
     int32_t length;
-    const char* buf = getObject_withoutNull(&length);
+    const char* buf = getObject_withoutNull(length);
     std::string inputStr(buf, length);
     boost::algorithm::to_lower(inputStr);
 
@@ -115,12 +114,12 @@ template<> inline NValue NValue::callUnary<FUNC_FOLD_UPPER>() const {
     if (isNull())
         return getNullStringValue();
 
-    if (getValueType() != VALUE_TYPE_VARCHAR) {
-        throwCastSQLException (getValueType(), VALUE_TYPE_VARCHAR);
+    if (getValueType() != ValueType::tVARCHAR) {
+        throwCastSQLException (getValueType(), ValueType::tVARCHAR);
     }
 
     int32_t length;
-    const char* buf = getObject_withoutNull(&length);
+    const char* buf = getObject_withoutNull(length);
     std::string inputStr(buf, length);
     boost::algorithm::to_upper(inputStr);
 
@@ -129,13 +128,13 @@ template<> inline NValue NValue::callUnary<FUNC_FOLD_UPPER>() const {
 
 /** implement the 2-argument SQL REPEAT function */
 template<> inline NValue NValue::call<FUNC_REPEAT>(const std::vector<NValue>& arguments) {
-    assert(arguments.size() == 2);
+    vassert(arguments.size() == 2);
     const NValue& strValue = arguments[0];
     if (strValue.isNull()) {
         return strValue;
     }
-    if (strValue.getValueType() != VALUE_TYPE_VARCHAR) {
-        throwCastSQLException (strValue.getValueType(), VALUE_TYPE_VARCHAR);
+    if (strValue.getValueType() != ValueType::tVARCHAR) {
+        throwCastSQLException (strValue.getValueType(), ValueType::tVARCHAR);
     }
 
     const NValue& countArg = arguments[1];
@@ -144,17 +143,15 @@ template<> inline NValue NValue::call<FUNC_REPEAT>(const std::vector<NValue>& ar
     }
     int64_t count = countArg.castAsBigIntAndGetValue();
     if (count < 0) {
-        char msg[1024];
-        snprintf(msg, 1024, "data exception: substring error");
-        throw SQLException(SQLException::data_exception_string_data_length_mismatch,
-                msg);
+        throwSQLException(SQLException::data_exception_string_data_length_mismatch,
+                "data exception: substring error");
     }
     if (count == 0) {
         return getTempStringValue("", 0);
     }
 
     int32_t argLength32;
-    const char* buf = strValue.getObject_withoutNull(&argLength32);
+    const char* buf = strValue.getObject_withoutNull(argLength32);
     int64_t argLength = static_cast<int64_t>(argLength32);
 
     bool overflowed = false;
@@ -180,23 +177,23 @@ template<> inline NValue NValue::call<FUNC_REPEAT>(const std::vector<NValue>& ar
 
 /** implement the 2-argument SQL FUNC_POSITION_CHAR function */
 template<> inline NValue NValue::call<FUNC_POSITION_CHAR>(const std::vector<NValue>& arguments) {
-    assert(arguments.size() == 2);
+    vassert(arguments.size() == 2);
     const NValue& target = arguments[0];
     if (target.isNull()) {
-        return getNullValue(VALUE_TYPE_INTEGER);
+        return getNullValue(ValueType::tINTEGER);
     }
-    if (target.getValueType() != VALUE_TYPE_VARCHAR) {
-        throwCastSQLException (target.getValueType(), VALUE_TYPE_VARCHAR);
+    if (target.getValueType() != ValueType::tVARCHAR) {
+        throwCastSQLException (target.getValueType(), ValueType::tVARCHAR);
     }
     const NValue& pool = arguments[1];
     if (pool.isNull()) {
-        return getNullValue(VALUE_TYPE_INTEGER);
+        return getNullValue(ValueType::tINTEGER);
     }
     int32_t lenTarget;
-    const char* targetChars = target.getObject_withoutNull(&lenTarget);
+    const char* targetChars = target.getObject_withoutNull(lenTarget);
 
     int32_t lenPool;
-    const char* poolChars = pool.getObject_withoutNull(&lenPool);
+    const char* poolChars = pool.getObject_withoutNull(lenPool);
     std::string poolStr(poolChars, lenPool);
 
     size_t position = poolStr.find(targetChars, 0, lenTarget);
@@ -210,13 +207,13 @@ template<> inline NValue NValue::call<FUNC_POSITION_CHAR>(const std::vector<NVal
 
 /** implement the 2-argument SQL LEFT function */
 template<> inline NValue NValue::call<FUNC_LEFT>(const std::vector<NValue>& arguments) {
-    assert(arguments.size() == 2);
+    vassert(arguments.size() == 2);
     const NValue& strValue = arguments[0];
     if (strValue.isNull()) {
         return strValue;
     }
-    if (strValue.getValueType() != VALUE_TYPE_VARCHAR) {
-        throwCastSQLException (strValue.getValueType(), VALUE_TYPE_VARCHAR);
+    if (strValue.getValueType() != ValueType::tVARCHAR) {
+        throwCastSQLException (strValue.getValueType(), ValueType::tVARCHAR);
     }
 
     const NValue& startArg = arguments[1];
@@ -233,20 +230,20 @@ template<> inline NValue NValue::call<FUNC_LEFT>(const std::vector<NValue>& argu
     }
 
     int32_t length;
-    const char* buf = strValue.getObject_withoutNull(&length);
+    const char* buf = strValue.getObject_withoutNull(length);
 
     return getTempStringValue(buf, (int32_t)(getIthCharPosition(buf, length, count+1) - buf));
 }
 
 /** implement the 2-argument SQL RIGHT function */
 template<> inline NValue NValue::call<FUNC_RIGHT>(const std::vector<NValue>& arguments) {
-    assert(arguments.size() == 2);
+    vassert(arguments.size() == 2);
     const NValue& strValue = arguments[0];
     if (strValue.isNull()) {
         return strValue;
     }
-    if (strValue.getValueType() != VALUE_TYPE_VARCHAR) {
-        throwCastSQLException (strValue.getValueType(), VALUE_TYPE_VARCHAR);
+    if (strValue.getValueType() != ValueType::tVARCHAR) {
+        throwCastSQLException (strValue.getValueType(), ValueType::tVARCHAR);
     }
 
     const NValue& startArg = arguments[1];
@@ -264,7 +261,7 @@ template<> inline NValue NValue::call<FUNC_RIGHT>(const std::vector<NValue>& arg
     }
 
     int32_t length;
-    const char* buf = strValue.getObject_withoutNull(&length);
+    const char* buf = strValue.getObject_withoutNull(length);
     const char *valueEnd = buf + length;
     int32_t charLen = getCharLength(buf, length);
     if (count >= charLen) {
@@ -276,18 +273,18 @@ template<> inline NValue NValue::call<FUNC_RIGHT>(const std::vector<NValue>& arg
 
 /** implement the 2-or-more-argument SQL CONCAT function */
 template<> inline NValue NValue::call<FUNC_CONCAT>(const std::vector<NValue>& arguments) {
-    assert(arguments.size() >= 2);
+    vassert(arguments.size() >= 2);
     int64_t size = 0;
     for (std::vector<NValue>::const_iterator iter = arguments.begin();
         iter !=arguments.end(); iter++) {
         if (iter->isNull()) {
             return getNullStringValue();
         }
-        if (iter->getValueType() != VALUE_TYPE_VARCHAR) {
-            throwCastSQLException (iter->getValueType(), VALUE_TYPE_VARCHAR);
+        if (iter->getValueType() != ValueType::tVARCHAR) {
+            throwCastSQLException (iter->getValueType(), ValueType::tVARCHAR);
         }
         int32_t length;
-        iter->getObject_withoutNull(&length);
+        iter->getObject_withoutNull(length);
         size += length;
         if (size > (int64_t)INT32_MAX) {
             throw SQLException(SQLException::data_exception_numeric_value_out_of_range,
@@ -305,7 +302,7 @@ template<> inline NValue NValue::call<FUNC_CONCAT>(const std::vector<NValue>& ar
     for (std::vector<NValue>::const_iterator iter = arguments.begin();
         iter !=arguments.end(); iter++) {
         int32_t length;
-        const char* next = iter->getObject_withoutNull(&length);
+        const char* next = iter->getObject_withoutNull(length);
         memcpy(buffer + cur, next, length);
         cur += length;
     }
@@ -315,13 +312,13 @@ template<> inline NValue NValue::call<FUNC_CONCAT>(const std::vector<NValue>& ar
 
 /** implement the 2-argument SQL SUBSTRING function */
 template<> inline NValue NValue::call<FUNC_VOLT_SUBSTRING_CHAR_FROM>(const std::vector<NValue>& arguments) {
-    assert(arguments.size() == 2);
+    vassert(arguments.size() == 2);
     const NValue& strValue = arguments[0];
     if (strValue.isNull()) {
         return strValue;
     }
-    if (strValue.getValueType() != VALUE_TYPE_VARCHAR) {
-        throwCastSQLException (strValue.getValueType(), VALUE_TYPE_VARCHAR);
+    if (strValue.getValueType() != ValueType::tVARCHAR) {
+        throwCastSQLException (strValue.getValueType(), ValueType::tVARCHAR);
     }
 
     const NValue& startArg = arguments[1];
@@ -330,7 +327,7 @@ template<> inline NValue NValue::call<FUNC_VOLT_SUBSTRING_CHAR_FROM>(const std::
     }
 
     int32_t lenValue;
-    const char* valueChars = strValue.getObject_withoutNull(&lenValue);
+    const char* valueChars = strValue.getObject_withoutNull(lenValue);
     const char *valueEnd = valueChars + lenValue;
 
     int64_t start = std::max(startArg.castAsBigIntAndGetValue(), static_cast<int64_t>(1L));
@@ -344,7 +341,7 @@ static inline std::string trim_function(std::string source, const std::string& m
         bool doltrim, bool dortrim) {
     // Assuming SOURCE string and MATCH string are both valid UTF-8 strings
     size_t mlen = match.length();
-    assert (mlen > 0);
+    vassert(mlen > 0);
     if (doltrim) {
         while (boost::starts_with(source, match)) {
             source.erase(0, mlen);
@@ -362,7 +359,7 @@ static inline std::string trim_function(std::string source, const std::string& m
 
 /** implement the 2-argument SQL TRIM functions */
 inline NValue NValue::trimWithOptions(const std::vector<NValue>& arguments, bool leading, bool trailing) {
-    assert(arguments.size() == 2);
+    vassert(arguments.size() == 2);
 
     for (int i = 0; i < arguments.size(); i++) {
         const NValue& arg = arguments[i];
@@ -372,12 +369,12 @@ inline NValue NValue::trimWithOptions(const std::vector<NValue>& arguments, bool
     }
 
     const NValue& trimChar = arguments[0];
-    if (trimChar.getValueType() != VALUE_TYPE_VARCHAR) {
-        throwCastSQLException (trimChar.getValueType(), VALUE_TYPE_VARCHAR);
+    if (trimChar.getValueType() != ValueType::tVARCHAR) {
+        throwCastSQLException (trimChar.getValueType(), ValueType::tVARCHAR);
     }
 
     int32_t length;
-    const char* buf = trimChar.getObject_withoutNull(&length);
+    const char* buf = trimChar.getObject_withoutNull(length);
     // SQL03 standard only allows a 1-character trim character.
     // In order to be compatible with other popular databases like MySQL,
     // our implementation also allows multiple characters, but rejects 0 characters.
@@ -389,11 +386,11 @@ inline NValue NValue::trimWithOptions(const std::vector<NValue>& arguments, bool
     std::string trimArg(buf, length);
 
     const NValue& strVal = arguments[1];
-    if (strVal.getValueType() != VALUE_TYPE_VARCHAR) {
-        throwCastSQLException (trimChar.getValueType(), VALUE_TYPE_VARCHAR);
+    if (strVal.getValueType() != ValueType::tVARCHAR) {
+        throwCastSQLException (trimChar.getValueType(), ValueType::tVARCHAR);
     }
 
-    buf = strVal.getObject_withoutNull(&length);
+    buf = strVal.getObject_withoutNull(length);
     std::string inputStr(buf, length);
 
     std::string result = trim_function(inputStr, trimArg, leading, trailing);
@@ -415,7 +412,7 @@ template<> inline NValue NValue::call<FUNC_TRIM_TRAILING_CHAR>(const std::vector
 
 /** implement the 3-argument SQL REPLACE function */
 template<> inline NValue NValue::call<FUNC_REPLACE>(const std::vector<NValue>& arguments) {
-    assert(arguments.size() == 3);
+    vassert(arguments.size() == 3);
 
     for (int i = 0; i < arguments.size(); i++) {
         const NValue& arg = arguments[i];
@@ -425,26 +422,26 @@ template<> inline NValue NValue::call<FUNC_REPLACE>(const std::vector<NValue>& a
     }
 
     const NValue& str0 = arguments[0];
-    if (str0.getValueType() != VALUE_TYPE_VARCHAR) {
-        throwCastSQLException (str0.getValueType(), VALUE_TYPE_VARCHAR);
+    if (str0.getValueType() != ValueType::tVARCHAR) {
+        throwCastSQLException (str0.getValueType(), ValueType::tVARCHAR);
     }
     int32_t length;
-    const char* buf = str0.getObject_withoutNull(&length);
+    const char* buf = str0.getObject_withoutNull(length);
     std::string targetStr(buf, length);
 
     const NValue& str1 = arguments[1];
-    if (str1.getValueType() != VALUE_TYPE_VARCHAR) {
-        throwCastSQLException (str1.getValueType(), VALUE_TYPE_VARCHAR);
+    if (str1.getValueType() != ValueType::tVARCHAR) {
+        throwCastSQLException (str1.getValueType(), ValueType::tVARCHAR);
     }
-    buf = str1.getObject_withoutNull(&length);
+    buf = str1.getObject_withoutNull(length);
     std::string matchStr(buf, length);
 
     const NValue& str2 = arguments[2];
 
-    if (str2.getValueType() != VALUE_TYPE_VARCHAR) {
-        throwCastSQLException (str2.getValueType(), VALUE_TYPE_VARCHAR);
+    if (str2.getValueType() != ValueType::tVARCHAR) {
+        throwCastSQLException (str2.getValueType(), ValueType::tVARCHAR);
     }
-    buf = str2.getObject_withoutNull(&length);
+    buf = str2.getObject_withoutNull(length);
     std::string replaceStr(buf, length);
 
     boost::algorithm::replace_all(targetStr, matchStr, replaceStr);
@@ -453,13 +450,13 @@ template<> inline NValue NValue::call<FUNC_REPLACE>(const std::vector<NValue>& a
 
 /** implement the 3-argument SQL SUBSTRING function */
 template<> inline NValue NValue::call<FUNC_SUBSTRING_CHAR>(const std::vector<NValue>& arguments) {
-    assert(arguments.size() == 3);
+    vassert(arguments.size() == 3);
     const NValue& strValue = arguments[0];
     if (strValue.isNull()) {
         return strValue;
     }
-    if (strValue.getValueType() != VALUE_TYPE_VARCHAR) {
-        throwCastSQLException (strValue.getValueType(), VALUE_TYPE_VARCHAR);
+    if (strValue.getValueType() != ValueType::tVARCHAR) {
+        throwCastSQLException (strValue.getValueType(), ValueType::tVARCHAR);
     }
 
     const NValue& startArg = arguments[1];
@@ -471,15 +468,14 @@ template<> inline NValue NValue::call<FUNC_SUBSTRING_CHAR>(const std::vector<NVa
         return getNullStringValue();
     }
     int32_t lenValue;
-    const char* valueChars = strValue.getObject_withoutNull(&lenValue);
+    const char* valueChars = strValue.getObject_withoutNull(lenValue);
     const char *valueEnd = valueChars + lenValue;
     int64_t start = startArg.castAsBigIntAndGetValue();
     int64_t length = lengthArg.castAsBigIntAndGetValue();
     if (length < 0) {
-        char message[128];
-        snprintf(message, 128, "data exception -- substring error, negative length argument %ld",
-                 (long)length);
-        throw SQLException(SQLException::data_exception_numeric_value_out_of_range, message);
+        throwSQLException(SQLException::data_exception_numeric_value_out_of_range,
+                "data exception -- substring error, negative length argument %ld",
+                static_cast<long>(length));
     }
     if (start < 1) {
         // According to the standard, START < 1 effectively
@@ -517,7 +513,7 @@ static inline std::string overlay_function(const char* ptrSource, size_t lengthS
 
 /** implement the 3 or 4 argument SQL OVERLAY function */
 template<> inline NValue NValue::call<FUNC_OVERLAY_CHAR>(const std::vector<NValue>& arguments) {
-    assert(arguments.size() == 3 || arguments.size() == 4);
+    vassert(arguments.size() == 3 || arguments.size() == 4);
 
     for (int i = 0; i < arguments.size(); i++) {
         const NValue& arg = arguments[i];
@@ -527,28 +523,27 @@ template<> inline NValue NValue::call<FUNC_OVERLAY_CHAR>(const std::vector<NValu
     }
 
     const NValue& str0 = arguments[0];
-    if (str0.getValueType() != VALUE_TYPE_VARCHAR) {
-        throwCastSQLException (str0.getValueType(), VALUE_TYPE_VARCHAR);
+    if (str0.getValueType() != ValueType::tVARCHAR) {
+        throwCastSQLException (str0.getValueType(), ValueType::tVARCHAR);
     }
     int32_t lenSrc;
-    const char* srcChars = str0.getObject_withoutNull(&lenSrc);
+    const char* srcChars = str0.getObject_withoutNull(lenSrc);
 
     const NValue& str1 = arguments[1];
-    if (str1.getValueType() != VALUE_TYPE_VARCHAR) {
-        throwCastSQLException (str1.getValueType(), VALUE_TYPE_VARCHAR);
+    if (str1.getValueType() != ValueType::tVARCHAR) {
+        throwCastSQLException (str1.getValueType(), ValueType::tVARCHAR);
     }
     int32_t lenInsert;
-    const char* insertChars = str1.getObject_withoutNull(&lenInsert);
+    const char* insertChars = str1.getObject_withoutNull(lenInsert);
     std::string insertStr(insertChars, lenInsert);
 
     const NValue& startArg = arguments[2];
 
     int64_t start = startArg.castAsBigIntAndGetValue();
     if (start <= 0) {
-        char message[128];
-        snprintf(message, 128, "data exception -- OVERLAY error, not positive start argument %ld",
-                 (long)start);
-        throw SQLException( SQLException::data_exception_numeric_value_out_of_range, message);
+        throwSQLException(SQLException::data_exception_numeric_value_out_of_range,
+                "data exception -- OVERLAY error, not positive start argument %ld",
+                static_cast<long>(start));
     }
 
     int64_t length = 0;
@@ -556,9 +551,9 @@ template<> inline NValue NValue::call<FUNC_OVERLAY_CHAR>(const std::vector<NValu
         const NValue& lengthArg = arguments[3];
         length = lengthArg.castAsBigIntAndGetValue();
         if (length < 0) {
-            char message[128];
-            snprintf(message, 128, "data exception -- OVERLAY error, negative length argument %ld",(long)length);
-            throw SQLException( SQLException::data_exception_numeric_value_out_of_range, message);
+            throwSQLException(SQLException::data_exception_numeric_value_out_of_range,
+                    "data exception -- OVERLAY error, negative length argument %ld",
+                    static_cast<long>(length));
         }
     }
     else {
@@ -566,7 +561,7 @@ template<> inline NValue NValue::call<FUNC_OVERLAY_CHAR>(const std::vector<NValu
         length = getCharLength(insertChars, lenInsert);
     }
 
-    assert(start >= 1);
+    vassert(start >= 1);
     std::string resultStr = overlay_function(srcChars, lenSrc, insertStr, start, length);
 
     return getTempStringValue(resultStr.c_str(), resultStr.length());
@@ -584,14 +579,14 @@ template<> inline NValue NValue::call<FUNC_VOLT_FORMAT_CURRENCY>(const std::vect
     static TTInt one("1");
     static TTInt five("5");
 
-    assert(arguments.size() == 2);
+    vassert(arguments.size() == 2);
     const NValue &arg1 = arguments[0];
     if (arg1.isNull()) {
         return getNullStringValue();
     }
     const ValueType type = arg1.getValueType();
-    if (type != VALUE_TYPE_DECIMAL) {
-        throwCastSQLException (type, VALUE_TYPE_DECIMAL);
+    if (type != ValueType::tDECIMAL) {
+        throwCastSQLException (type, ValueType::tDECIMAL);
     }
 
     std::ostringstream out;
@@ -664,13 +659,13 @@ template<> inline NValue NValue::callUnary<FUNC_VOLT_STR>() const {
        return getNullStringValue();
     }
 
-    if (getValueType() != VALUE_TYPE_DECIMAL && getValueType() != VALUE_TYPE_DOUBLE) {
-        throwCastSQLException (getValueType(), VALUE_TYPE_DECIMAL);
+    if (getValueType() != ValueType::tDECIMAL && getValueType() != ValueType::tDOUBLE) {
+        throwCastSQLException (getValueType(), ValueType::tDECIMAL);
     }
 
     std::ostringstream out;
     TTInt scaledValue;
-    if(getValueType() == VALUE_TYPE_DOUBLE)
+    if(getValueType() == ValueType::tDOUBLE)
     {
         scaledValue = castAsDecimal().castAsDecimalAndGetValue();
     } else {
@@ -747,20 +742,20 @@ template<> inline NValue NValue::call<FUNC_VOLT_STR>(const std::vector<NValue>& 
     static TTInt one("1");
     static TTInt five("5");
 
-    assert(arguments.size() > 0 && arguments.size() < 4);
+    vassert(arguments.size() > 0 && arguments.size() < 4);
     const NValue &arg1 = arguments[0];
     if (arg1.isNull()) {
         return getNullStringValue();
     }
 
     const ValueType type = arg1.getValueType();
-    if (type != VALUE_TYPE_DECIMAL && type != VALUE_TYPE_DOUBLE) {
-        throwCastSQLException (type, VALUE_TYPE_DECIMAL);
+    if (type != ValueType::tDECIMAL && type != ValueType::tDOUBLE) {
+        throwCastSQLException (type, ValueType::tDECIMAL);
     }
 
     std::ostringstream out;
     TTInt scaledValue;
-    if (type == VALUE_TYPE_DOUBLE) {
+    if (type == ValueType::tDOUBLE) {
         scaledValue = arg1.castAsDecimal().castAsDecimalAndGetValue();
     } else {
         scaledValue = arg1.castAsDecimalAndGetValue();
@@ -861,22 +856,22 @@ static std::string pcre2_error_code_message(int error_code, std::string prefix)
 
 /** Implement the VoltDB SQL function regexp_position for re-based pattern matching */
 template<> inline NValue NValue::call<FUNC_VOLT_REGEXP_POSITION>(const std::vector<NValue>& arguments) {
-    assert(arguments.size() == 2 || arguments.size() == 3);
+    vassert(arguments.size() == 2 || arguments.size() == 3);
 
     const NValue& source = arguments[0];
     if (source.isNull()) {
-        return getNullValue(VALUE_TYPE_BIGINT);
+        return getNullValue(ValueType::tBIGINT);
     }
-    if (source.getValueType() != VALUE_TYPE_VARCHAR) {
-        throwCastSQLException(source.getValueType(), VALUE_TYPE_VARCHAR);
+    if (source.getValueType() != ValueType::tVARCHAR) {
+        throwCastSQLException(source.getValueType(), ValueType::tVARCHAR);
     }
 
     const NValue& pat = arguments[1];
     if (pat.isNull()) {
-        return getNullValue(VALUE_TYPE_BIGINT);
+        return getNullValue(ValueType::tBIGINT);
     }
-    if (pat.getValueType() != VALUE_TYPE_VARCHAR) {
-        throwCastSQLException(pat.getValueType(), VALUE_TYPE_VARCHAR);
+    if (pat.getValueType() != ValueType::tVARCHAR) {
+        throwCastSQLException(pat.getValueType(), ValueType::tVARCHAR);
     }
 
     uint32_t syntaxOpts = PCRE2_UTF;
@@ -884,13 +879,13 @@ template<> inline NValue NValue::call<FUNC_VOLT_REGEXP_POSITION>(const std::vect
     if (arguments.size() == 3) {
         const NValue& flags = arguments[2];
         if (!flags.isNull()) {
-            if (flags.getValueType() != VALUE_TYPE_VARCHAR) {
-                 throwCastSQLException(flags.getValueType(), VALUE_TYPE_VARCHAR);
+            if (flags.getValueType() != ValueType::tVARCHAR) {
+                 throwCastSQLException(flags.getValueType(), ValueType::tVARCHAR);
             }
 
             int32_t lenFlags;
             const char* flagChars = reinterpret_cast<const char*>
-                (flags.getObject_withoutNull(&lenFlags));
+                (flags.getObject_withoutNull(lenFlags));
             // temporary workaround to make sure the string we are operating on is null terminated
             std::string flagStr(flagChars, lenFlags);
 
@@ -911,10 +906,10 @@ template<> inline NValue NValue::call<FUNC_VOLT_REGEXP_POSITION>(const std::vect
 
     int32_t lenSource;
     const unsigned char* sourceChars = reinterpret_cast<const unsigned char*>
-        (source.getObject_withoutNull(&lenSource));
+        (source.getObject_withoutNull(lenSource));
     int32_t lenPat;
     const unsigned char* patChars = reinterpret_cast<const unsigned char*>
-        (pat.getObject_withoutNull(&lenPat));
+        (pat.getObject_withoutNull(lenPat));
     // Compile the pattern.
 
     int error_code = 0;
@@ -970,4 +965,3 @@ template<> inline NValue NValue::call<FUNC_VOLT_REGEXP_POSITION>(const std::vect
 }
 }
 
-#endif /* STRINGFUNCTIONS_H */

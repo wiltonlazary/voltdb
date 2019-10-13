@@ -26,7 +26,6 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.NoSuchElementException;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
@@ -37,19 +36,21 @@ import org.voltcore.messaging.HostMessenger;
 import org.voltcore.utils.DBBPool;
 import org.voltcore.utils.Pair;
 import org.voltdb.CatalogContext;
-import org.voltdb.ExportStatsBase;
+import org.voltdb.ClientInterface;
 import org.voltdb.ExportStatsBase.ExportStatsRow;
-import org.voltdb.RealVoltDB;
-import org.voltdb.StatsSelector;
+import org.voltdb.SimpleClientResponseAdapter;
+import org.voltdb.SnapshotCompletionMonitor.ExportSnapshotTuple;
+import org.voltdb.TTLManager;
 import org.voltdb.VoltDB;
 import org.voltdb.VoltTable;
 import org.voltdb.catalog.CatalogMap;
-import org.voltdb.catalog.Cluster;
 import org.voltdb.catalog.Connector;
 import org.voltdb.catalog.ConnectorProperty;
 import org.voltdb.catalog.ConnectorTableInfo;
-import org.voltdb.catalog.Database;
+import org.voltdb.client.ProcedureCallback;
+import org.voltdb.export.ExportDataSource.StreamStartAction;
 import org.voltdb.sysprocs.ExportControl.OperationMode;
+import org.voltdb.utils.CatalogUtil;
 import org.voltdb.utils.LogKeys;
 import org.voltdb.utils.VoltFile;
 
@@ -67,7 +68,7 @@ import com.google_voltpatches.common.base.Preconditions;
  *
  * Processors are loaded by reflection based on configuration in project.xml.
  */
-public class ExportManager
+public class ExportManager implements ExportManagerInterface
 {
     /**
      * the only supported processor class
@@ -99,60 +100,12 @@ public class ExportManager
     public static final byte RELEASE_BUFFER = 1;
 
     /**
-     * Master sends GIVE_MASTERSHIP to one replica to transfer leadership.
-     */
-    public static final byte GIVE_MASTERSHIP = 2;
-
-    /**
-     * Master sends GAP_QUERY to all nodes to know: can you cover the next sequence number?
-     *
-     * This is called when master hits gap in the stream.
-     */
-    public static final byte GAP_QUERY = 3;
-
-    /**
-     * Node that receives GAP_QUERY sends back QUERY_RESPONSE with the information that whether
-     * it has data for the next sequence number.
-     */
-    public static final byte QUERY_RESPONSE = 4;
-
-    /**
-     * Data sources under new SPI or SPI who receives failed host notification
-     * sends TASK_MASTERSHIP to all nodes to ask master to transfer leadership back.
-     * If master doesn't exist promote itself to be master.
-     */
-    public static final byte TAKE_MASTERSHIP = 5;
-
-    /**
-     * Node that receives TAKE_MASTERSHIP sends back TAKE_MASTERSHIP_RESPONSE to indicate
-     * it's not master.
-     */
-    public static final byte TAKE_MASTERSHIP_RESPONSE = 6;
-
-    /**
-     * Thrown if the initial setup of the loader fails
-     */
-    public static class SetupException extends Exception {
-        private static final long serialVersionUID = 1L;
-
-        SetupException(final String msg) {
-            super(msg);
-        }
-
-        SetupException(final Throwable cause) {
-            super(cause);
-        }
-    }
-
-    /**
      * Connections OLAP loaders. Currently at most one loader allowed.
      * Supporting multiple loaders mainly involves reference counting
      * the EE data blocks and bookkeeping ACKs from processors.
      */
     AtomicReference<ExportDataProcessor> m_processor = new AtomicReference<ExportDataProcessor>();
 
-    /** Obtain the global ExportManager via its instance() method */
-    private static ExportManager m_self;
     private ExportStats m_exportStats;
     private final int m_hostId;
 
@@ -165,180 +118,27 @@ public class ExportManager
     private int m_exportTablesCount = 0;
     private int m_connCount = 0;
     private boolean m_startPolling = false;
+    private SimpleClientResponseAdapter m_adapter;
+    private ClientInterface m_ci;
 
-
-    public class ExportStats extends ExportStatsBase {
-        List<ExportStatsRow> m_stats;
-
-        ExportStats() {
-            super();
-        }
-
-        @Override
-        public Iterator<Object> getStatsRowKeyIterator(boolean interval) {
-            m_stats = getStats(interval);
-            return buildIterator();
-        }
-
-        private Iterator<Object> buildIterator() {
-            return new Iterator<Object>() {
-                int index = 0;
-
-                @Override
-                public boolean hasNext() {
-                    return index < m_stats.size();
-                }
-
-                @Override
-                public Object next() {
-                    if (index < m_stats.size()) {
-                        return index++;
-                    }
-                    throw new NoSuchElementException();
-                }
-
-                @Override
-                public void remove() {
-                    throw new UnsupportedOperationException();
-                }
-
-            };
-        }
-
-        @Override
-        protected void updateStatsRow(Object rowKey, Object rowValues[]) {
-            super.updateStatsRow(rowKey, rowValues);
-            int rowIndex = (Integer) rowKey;
-            assert (rowIndex >= 0);
-            assert (rowIndex < m_stats.size());
-            ExportStatsRow stat = m_stats.get(rowIndex);
-            rowValues[columnNameToIndex.get(Columns.SITE_ID)] = stat.m_siteId;
-            rowValues[columnNameToIndex.get(Columns.PARTITION_ID)] = stat.m_partitionId;
-            rowValues[columnNameToIndex.get(Columns.SOURCE_NAME)] = stat.m_sourceName;
-            rowValues[columnNameToIndex.get(Columns.EXPORT_TARGET)] = stat.m_exportTarget;
-            rowValues[columnNameToIndex.get(Columns.ACTIVE)] = stat.m_exportingRole;
-            rowValues[columnNameToIndex.get(Columns.TUPLE_COUNT)] = stat.m_tupleCount;
-            rowValues[columnNameToIndex.get(Columns.TUPLE_PENDING)] = stat.m_tuplesPending;
-            rowValues[columnNameToIndex.get(Columns.LAST_QUEUED_TIMESTAMP)] = stat.m_lastQueuedTimestamp;
-            rowValues[columnNameToIndex.get(Columns.LAST_ACKED_TIMESTAMP)] = stat.m_lastAckedTimestamp;
-            rowValues[columnNameToIndex.get(Columns.AVERAGE_LATENCY)] = stat.m_averageLatency;
-            rowValues[columnNameToIndex.get(Columns.MAX_LATENCY)] = stat.m_maxLatency;
-            rowValues[columnNameToIndex.get(Columns.QUEUE_GAP)] = stat.m_queueGap;
-            rowValues[columnNameToIndex.get(Columns.STATUS)] = stat.m_status;
-        }
-
-        public ExportStatsRow getStatsRow(Object rowKey) {
-            int rowIndex = (Integer) rowKey;
-            assert (rowIndex >= 0);
-            assert (rowIndex < m_stats.size());
-            ExportStatsRow stat = m_stats.get(rowIndex);
-            return stat;
-        }
-    }
-
-    /**
-     * Construct ExportManager using catalog.
-     * @param myHostId
-     * @param catalogContext
-     * @throws ExportManager.SetupException
-     */
-    // FIXME - this synchronizes on the ExportManager class, but everyone else synchronizes on the instance.
-    public static synchronized void initialize(
-            int myHostId,
-            CatalogContext catalogContext,
-            boolean isRejoin,
-            boolean forceCreate,
-            HostMessenger messenger,
-            List<Pair<Integer, Integer>> partitions)
-            throws ExportManager.SetupException
-    {
-        ExportManager em = new ExportManager(myHostId, catalogContext, messenger);
-        m_self = em;
-        if (forceCreate) {
-            em.clearOverflowData();
-        }
-        em.initialize(catalogContext, partitions, isRejoin);
-
-        RealVoltDB db=(RealVoltDB)VoltDB.instance();
-        db.getStatsAgent().registerStatsSource(StatsSelector.EXPORT,
-                myHostId, // m_siteId,
-                em.getExportStats());
-    }
-
-    private CatalogMap<Connector> getConnectors(CatalogContext catalogContext) {
-        final Cluster cluster = catalogContext.catalog.getClusters().get("cluster");
-        final Database db = cluster.getDatabases().get("database");
-        return db.getConnectors();
-    }
-
-    private boolean hasEnabledConnectors(CatalogMap<Connector> connectors) {
-        for (Connector conn : connectors) {
-            if (conn.getEnabled() && !conn.getTableinfo().isEmpty()) {
-                return true;
-            }
-        }
-        return false;
+    @Override
+    public ExportManagerInterface.ExportMode getExportMode() {
+        return ExportManagerInterface.ExportMode.BASIC;
     }
 
     /**
      * Indicate to associated {@link ExportGeneration}s to become
-     * masters for the given partition id
+     * leaders for the given partition id
      * @param partitionId
      */
-    synchronized public void takeMastership(int partitionId) {
+    @Override
+    synchronized public void becomeLeader(int partitionId) {
         m_masterOfPartitions.add(partitionId);
         ExportGeneration generation = m_generation.get();
         if (generation == null) {
             return;
         }
-        generation.takeMastership(partitionId);
-    }
-
-    /**
-     * Indicate local partition became the SPI Leader
-     * still waiting for old leader (ack) to trigger take over mastership
-     * @param partitionId
-     */
-    synchronized public void prepareAcceptMastership(int partitionId) {
-        // can't acquire mastership twice for the same partition id
-        if (!m_masterOfPartitions.add(partitionId)) {
-            return;
-        }
-        if (exportLog.isDebugEnabled()) {
-            exportLog.debug("Export streams on local partition " + partitionId + " will become master.");
-        }
-    }
-
-    /**
-     * Indicate to associated {@link ExportGeneration}s to
-     * prepare give up mastership for the given partition id to hostId
-     * @param partitionId
-     */
-    synchronized public void prepareTransferMastership(int partitionId, int hostId) {
-        // remove mastership for partition id, so when failure happen during the mastership transfer
-        // this node can be elected as new master again.
-        m_masterOfPartitions.remove(partitionId);
-
-        if (exportLog.isDebugEnabled()) {
-            exportLog.debug("Export stream masters on " + partitionId + " are going to migrate away");
-        }
-        ExportGeneration generation = m_generation.get();
-        if (generation == null) {
-            return;
-        }
-        generation.prepareTransferMastership(partitionId, hostId);
-    }
-
-    /**
-     * Get the global instance of the ExportManager.
-     * @return The global single instance of the ExportManager.
-     */
-    public static ExportManager instance() {
-        return m_self;
-    }
-
-    public static void setInstanceForTest(ExportManager self) {
-        m_self = self;
+        generation.becomeLeader(partitionId);
     }
 
     protected ExportManager() {
@@ -349,26 +149,28 @@ public class ExportManager
     /**
      * Read the catalog to setup manager and loader(s)
      */
-    private ExportManager(
+    public ExportManager(
             int myHostId,
             CatalogContext catalogContext,
             HostMessenger messenger)
     throws ExportManager.SetupException
     {
+        exportLog.info("Export starting in BASIC mode");
         m_hostId = myHostId;
         m_messenger = messenger;
         m_exportStats = new ExportStats();
+
+        exportLog.info("Running " + this.getClass().getName());
 
         boolean compress = !Boolean.getBoolean(StreamBlockQueue.EXPORT_DISABLE_COMPRESSION_OPTION);
         exportLog.info("Export has compression "
                 + (compress ? "enabled" : "disabled") + " in " + VoltDB.instance().getExportOverflowPath());
 
-        CatalogMap<Connector> connectors = getConnectors(catalogContext);
-        if (!hasEnabledConnectors(connectors)) {
+        CatalogMap<Connector> connectors = CatalogUtil.getConnectors(catalogContext);
+        if (!CatalogUtil.hasEnabledConnectors(connectors)) {
             exportLog.info("System is not using any export functionality or connectors configured are disabled.");
             return;
         }
-
         updateProcessorConfig(connectors);
 
         exportLog.info(String.format("Export is enabled and can overflow to %s.", VoltDB.instance().getExportOverflowPath()));
@@ -378,7 +180,8 @@ public class ExportManager
         return m_messenger;
     }
 
-    private void clearOverflowData() throws ExportManager.SetupException {
+    @Override
+    public void clearOverflowData() throws ExportManagerInterface.SetupException {
         String overflowDir = VoltDB.instance().getExportOverflowPath();
         try {
             exportLog.info(
@@ -395,11 +198,12 @@ public class ExportManager
 
     }
 
-    public synchronized void startPolling(CatalogContext catalogContext) {
+    @Override
+    public synchronized void startPolling(CatalogContext catalogContext, StreamStartAction action) {
         m_startPolling = true;
 
-        CatalogMap<Connector> connectors = getConnectors(catalogContext);
-        if(!hasEnabledConnectors(connectors)) {
+        CatalogMap<Connector> connectors = CatalogUtil.getConnectors(catalogContext);
+        if(!CatalogUtil.hasEnabledConnectors(connectors)) {
             exportLog.info("System is not using any export functionality or connectors configured are disabled.");
             return;
         }
@@ -411,6 +215,7 @@ public class ExportManager
     }
 
     private void updateProcessorConfig(final CatalogMap<Connector> connectors) {
+
         Map<String, Pair<Properties, Set<String>>> config = new HashMap<>();
 
         // If the export source changes before the previous generation drains
@@ -457,32 +262,39 @@ public class ExportManager
         m_processorConfig = config;
     }
 
+    @Override
     public int getExportTablesCount() {
         return m_exportTablesCount;
     }
 
+    @Override
     public int getConnCount() {
         return m_connCount;
     }
 
     /** Creates the initial export processor if export is enabled */
-    private void initialize(CatalogContext catalogContext, List<Pair<Integer, Integer>> localPartitionsToSites,
+    @Override
+    public void initialize(CatalogContext catalogContext, List<Pair<Integer, Integer>> localPartitionsToSites,
             boolean isRejoin) {
         try {
-            CatalogMap<Connector> connectors = getConnectors(catalogContext);
-            if (!hasEnabledConnectors(connectors)) {
+            CatalogMap<Connector> connectors = CatalogUtil.getConnectors(catalogContext);
+            if (exportLog.isDebugEnabled()) {
+                exportLog.debug("initialize for " + connectors.size() + " connectors.");
+                CatalogUtil.dumpConnectors(exportLog, connectors);
+            }
+            if (!CatalogUtil.hasExportedTables(connectors)) {
                 return;
             }
 
             if (exportLog.isDebugEnabled()) {
-                exportLog.debug("Creating connector " + m_loaderClass);
+                exportLog.debug("Creating processor " + m_loaderClass);
             }
             ExportDataProcessor newProcessor = getNewProcessorWithProcessConfigSet(m_processorConfig);
             m_processor.set(newProcessor);
 
             File exportOverflowDirectory = new File(VoltDB.instance().getExportOverflowPath());
-            ExportGeneration generation = new ExportGeneration(exportOverflowDirectory);
-            generation.initialize(m_messenger, m_hostId, catalogContext,
+            ExportGeneration generation = new ExportGeneration(exportOverflowDirectory, m_messenger);
+            generation.initialize(m_hostId, catalogContext,
                     connectors, newProcessor, localPartitionsToSites, exportOverflowDirectory);
 
             m_generation.set(generation);
@@ -499,23 +311,32 @@ public class ExportManager
         }
     }
 
+    @Override
     public synchronized void updateCatalog(CatalogContext catalogContext, boolean requireCatalogDiffCmdsApplyToEE,
             boolean requiresNewExportGeneration, List<Pair<Integer, Integer>> localPartitionsToSites)
     {
-        final Cluster cluster = catalogContext.catalog.getClusters().get("cluster");
-        final Database db = cluster.getDatabases().get("database");
-        final CatalogMap<Connector> connectors = db.getConnectors();
+        final CatalogMap<Connector> connectors = CatalogUtil.getConnectors(catalogContext);
 
-        Map<String, Pair<Properties, Set<String>>> processorConfigBeforeUpdate = m_processorConfig;
-        updateProcessorConfig(connectors);
-        if (m_processorConfig.isEmpty() && processorConfigBeforeUpdate.isEmpty()) {
-            return;
+        if (exportLog.isDebugEnabled()) {
+            exportLog.debug("UpdateCatalog: requiresNewGeneration: " + requiresNewExportGeneration
+                    + ", for " + connectors.size() + " connectors.");
+            CatalogUtil.dumpConnectors(exportLog, connectors);
         }
+
+        // Update processor config: note that we want to run a generation update even if the
+        // processor config has no changes; we still need to handle changes in the exported tables
+        updateProcessorConfig(connectors);
+
         if (!requiresNewExportGeneration) {
+            // Even for catalog update doesn't affect export, genId still need to pass to EDS.
+            // Because each ACK message is associated with a genId.
+            if (m_generation.get() != null) {
+                m_generation.get().updateGenerationId(catalogContext.m_genId);
+            }
             exportLog.info("No stream related changes in update catalog.");
             return;
         }
-        /**
+        /*
          * This checks if the catalogUpdate was done in EE or not. If catalog update is skipped for @UpdateClasses and such
          * EE does not roll to new generation and thus we need to ignore creating new generation roll with the current generation.
          * If anything changes in getDiffCommandsForEE or design changes pay attention to fix this.
@@ -527,7 +348,7 @@ public class ExportManager
         if (m_generation.get() == null) {
             File exportOverflowDirectory = new File(VoltDB.instance().getExportOverflowPath());
             try {
-                ExportGeneration gen = new ExportGeneration(exportOverflowDirectory);
+                ExportGeneration gen = new ExportGeneration(exportOverflowDirectory, m_messenger);
                 m_generation.set(gen);
             } catch (IOException crash) {
                 //This means durig UAC we had a bad disk on a node or bad directory.
@@ -549,7 +370,7 @@ public class ExportManager
                 ExportDataProcessor newProcessor = getNewProcessorWithProcessConfigSet(m_processorConfig);
                 m_processor.set(newProcessor);
                 generation.initializeGenerationFromCatalog(catalogContext,
-                        connectors, newProcessor, m_hostId, m_messenger, localPartitionsToSites);
+                        connectors, newProcessor, m_hostId, localPartitionsToSites, true);
                 if (exportLog.isDebugEnabled()) {
                     exportLog.debug("Creating connector " + m_loaderClass);
                 }
@@ -560,17 +381,17 @@ public class ExportManager
                 newProcessor.readyForData();
 
                 /*
-                 * When it isn't startup, it is necessary to kick things off with the mastership
+                 * When it isn't startup, it is necessary to kick things off with the leadership
                  * settings that already exist
                  *
                  * This strategy is the one that piggy backs on
-                 * regular partition mastership distribution to determine
+                 * regular partition leadership distribution to determine
                  * who will process export data for different partitions.
-                 * We stashed away all the ones we have mastership of
+                 * We stashed away all the ones we have leadership of
                  * in m_masterOfPartitions
                  */
                 for (Integer partitionId: m_masterOfPartitions) {
-                    generation.acceptMastership(partitionId);
+                    generation.becomeLeader(partitionId);
                 }
             }
             catch (final ClassNotFoundException e) {
@@ -603,7 +424,7 @@ public class ExportManager
         if (exportLog.isDebugEnabled()) {
             exportLog.debug("Processor shutdown completed, install new export processor");
         }
-        generation.unacceptMastership();
+        generation.onProcessorShutdown();
         if (exportLog.isDebugEnabled()) {
             exportLog.debug("Existing export datasources unassigned.");
         }
@@ -611,7 +432,7 @@ public class ExportManager
             ExportDataProcessor newProcessor = getNewProcessorWithProcessConfigSet(config);
             //Load any missing tables.
             generation.initializeGenerationFromCatalog(catalogContext, connectors, newProcessor,
-                    m_hostId, m_messenger, partitions);
+                    m_hostId, partitions, true);
             for (Pair<Integer, Integer> partition : partitions) {
                 generation.updateAckMailboxes(partition.getFirst(), null);
             }
@@ -627,22 +448,25 @@ public class ExportManager
         }
 
         for (int partitionId : m_masterOfPartitions) {
-            generation.acceptMastership(partitionId);
+            if (exportLog.isDebugEnabled()) {
+                exportLog.debug("Set mastership on partition " + partitionId);
+            }
+            generation.becomeLeader(partitionId);
         }
     }
 
     private  ExportDataProcessor getNewProcessorWithProcessConfigSet(Map<String, Pair<Properties, Set<String>>> config) throws ClassNotFoundException, InstantiationException, IllegalAccessException {
         final Class<?> loaderClass = Class.forName(m_loaderClass);
         ExportDataProcessor newProcessor = (ExportDataProcessor)loaderClass.newInstance();
-        newProcessor.addLogger(exportLog);
         newProcessor.setProcessorConfig(config);
         return newProcessor;
     }
 
+    @Override
     public void shutdown() {
         ExportGeneration generation = m_generation.getAndSet(null);
         if (generation != null) {
-            generation.close(m_messenger);
+            generation.close();
         }
         ExportDataProcessor proc = m_processor.getAndSet(null);
         if (proc != null) {
@@ -650,7 +474,8 @@ public class ExportManager
         }
     }
 
-    private List<ExportStatsRow> getStats(final boolean interval) {
+    @Override
+    public List<ExportStatsRow> getStats(final boolean interval) {
         try {
             ExportGeneration generation = m_generation.get();
             if (generation != null) {
@@ -664,83 +489,126 @@ public class ExportManager
     }
 
     /*
-     * This method pulls double duty as a means of pushing export buffers
-     * and "syncing" export data to disk. Syncing doesn't imply fsync, it just means
-     * writing the data to a file instead of keeping it all in memory.
      * End of stream indicates that no more data is coming from this source
      * for this generation.
      */
     public static void pushEndOfStream(
             int partitionId,
-            String signature) {
+            String tableName) {
     }
     /*
-     * This method pulls double duty as a means of pushing export buffers
-     * and "syncing" export data to disk. Syncing doesn't imply fsync, it just means
-     * writing the data to a file instead of keeping it all in memory.
-     * End of stream indicates that no more data is coming from this source
-     * for this generation.
+     * Push an export buffer
      */
     public static void pushExportBuffer(
             int partitionId,
-            String signature,
+            String tableName,
             long startSequenceNumber,
+            long committedSequenceNumber,
             long tupleCount,
             long uniqueId,
-            long genId,
             long bufferPtr,
-            ByteBuffer buffer,
-            boolean sync) {
+            ByteBuffer buffer) {
         //For validating that the memory is released
         if (bufferPtr != 0) DBBPool.registerUnsafeMemory(bufferPtr);
-        ExportManager instance = instance();
+        ExportManagerInterface instance = ExportManagerInterface.instance();
+        instance.pushBuffer(partitionId, tableName,
+                startSequenceNumber, committedSequenceNumber,
+                tupleCount, uniqueId, buffer);
+    }
+
+    @Override
+    public void pushBuffer(
+            int partitionId,
+            String tableName,
+            long startSequenceNumber,
+            long committedSequenceNumber,
+            long tupleCount,
+            long uniqueId,
+            ByteBuffer buffer) {
+
         try {
-            ExportGeneration generation = instance.m_generation.get();
+            Generation generation = getGeneration();
             if (generation == null) {
                 if (buffer != null) {
                     DBBPool.wrapBB(buffer).discard();
                 }
                 return;
             }
-            generation.pushExportBuffer(partitionId, signature, startSequenceNumber,
-                    (int)tupleCount, uniqueId, genId, buffer, sync);
+            generation.pushExportBuffer(partitionId, tableName,
+                    startSequenceNumber, committedSequenceNumber,
+                    (int)tupleCount, uniqueId, buffer);
         } catch (Exception e) {
             //Don't let anything take down the execution site thread
             exportLog.error("Error pushing export buffer", e);
         }
     }
 
+
+    @Override
     public void updateInitialExportStateToSeqNo(int partitionId, String signature,
-                                                boolean isRecover, boolean isRejoin,
-                                                Map<Integer, Pair<Long, Long>> sequenceNumberPerPartition,
-                                                boolean isLowestSite) {
-        //If the generation was completely drained, wait for the task to finish running
-        //by waiting for the permit that will be generated
+                                                StreamStartAction action,
+                                                Map<Integer, ExportSnapshotTuple> sequenceNumberPerPartition) {
         ExportGeneration generation = m_generation.get();
         if (generation != null) {
             generation.updateInitialExportStateToSeqNo(partitionId, signature,
-                                                       isRecover, isRejoin,
-                                                       sequenceNumberPerPartition, isLowestSite);
+                                                       action,
+                                                       sequenceNumberPerPartition);
         }
     }
 
-    public static synchronized void sync(final boolean nofsync) {
+    public void updateDanglingExportStates(StreamStartAction action,
+            Map<String, Map<Integer, ExportSnapshotTuple>> exportSequenceNumbers) {
+        ExportGeneration generation = m_generation.get();
+        if (generation != null) {
+            generation.updateDanglingExportStates(action, exportSequenceNumbers);
+        }
+    }
+
+    // FIXME: Review synchronization
+    @Override
+    public synchronized void sync() {
         if (exportLog.isDebugEnabled()) {
             exportLog.debug("Syncing export data");
         }
-        ExportGeneration generation = instance().m_generation.get();
+        syncSources();
+    }
+
+    private static void syncSources() {
+
+        Generation generation = ExportManagerInterface.instance().getGeneration();
         if (generation != null) {
-            generation.sync(nofsync);
+            generation.sync();
         }
     }
 
+    @Override
     public ExportStats getExportStats() {
         return m_exportStats;
     }
 
+    @Override
+    public Generation getGeneration() {
+        return m_generation.get();
+    }
+
+    @Override
     public void processStreamControl(String exportStream, List<String> exportTargets, OperationMode operation, VoltTable results) {
         if (m_generation.get() != null) {
            m_generation.get().processStreamControl(exportStream, exportTargets, operation, results);
         }
+    }
+
+    @Override
+    public void clientInterfaceStarted(ClientInterface clientInterface) {
+        m_ci = clientInterface;
+        m_adapter = new SimpleClientResponseAdapter(ClientInterface.MIGRATE_ROWS_DELETE_CID,
+                                                    "MigrateRowsAdapter");
+        m_ci.bindAdapter(m_adapter, null);
+    }
+
+    @Override
+    public void invokeMigrateRowsDelete(int partition, String tableName, long deletableTxnId,  ProcedureCallback cb) {
+        m_ci.getDispatcher().getInternelAdapterNT().callProcedure(m_ci.getInternalUser(), true, TTLManager.NT_PROC_TIMEOUT, cb,
+                "@MigrateRowsDeleterNT", new Object[] {partition, tableName, deletableTxnId});
     }
 }

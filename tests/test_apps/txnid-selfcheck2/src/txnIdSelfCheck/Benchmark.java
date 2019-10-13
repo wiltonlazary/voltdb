@@ -169,7 +169,7 @@ public class Benchmark {
         // Biglt,Trunclt,Cappedlt,Loadlt are also recognized and apply to BOTH part and repl threads
         ArrayList<String> enabledThreads = null;
 
-        ArrayList<String> allThreads = new ArrayList<String>(Arrays.asList("clients,partBiglt,replBiglt,partTrunclt,replTrunclt,partCappedlt,replCappedlt,partLoadlt,replLoadlt,readThread,adHocMayhemThread,idpt,updateclasses,partNDlt,replNDlt".split(",")));
+        ArrayList<String> allThreads = new ArrayList<String>(Arrays.asList("clients,partBiglt,replBiglt,partTrunclt,replTrunclt,partCappedlt,replCappedlt,partLoadlt,replLoadlt,readThread,adHocMayhemThread,idpt,updateclasses,partNDlt,replNDlt,partttlMigratelt,replttlMigratelt,partTasklt,replTasklt".split(",")));
 
         @Option(desc = "Enable topology awareness")
         boolean topologyaware = false;
@@ -559,8 +559,12 @@ public class Benchmark {
     DdlThread ddlt = null;
     List<ClientThread> clientThreads = null;
     UpdateClassesThread updcls = null;
-    NibbleDeleteLoader partNDlt = null;
-    NibbleDeleteLoader replNDlt = null;
+    TTLLoader partNDlt = null;
+    TTLLoader replNDlt = null;
+    TTLLoader partttlMigratelt = null;
+    TTLLoader replttlMigratelt = null;
+    TaskLoader replTasklt = null;
+    TaskLoader partTasklt = null;
 
     /**
      * Core benchmark code.
@@ -661,18 +665,41 @@ public class Benchmark {
         log.info(HORIZONTAL_RULE);
 
         // Nibble delete Loader
-        partNDlt = null;
         if (!(config.disabledThreads.contains("partNDlt") || config.disabledThreads.contains("NDlt"))) {
-            partNDlt = new NibbleDeleteLoader(client, "nibdp",
-                    100000, 1024, 50, permits, partitionCount);
+            partNDlt = new TTLLoader(client, "nibdp",
+                    100000, 1024, 50, permits, partitionCount, "TTL");
             partNDlt.start();
         }
 
-        replNDlt = null;
         if (config.mpratio > 0.0 && !(config.disabledThreads.contains("replNDlt") || config.disabledThreads.contains("NDlt"))) {
-            replNDlt = new NibbleDeleteLoader(client, "nibdr",
-                    100000, 1024, 3, permits, partitionCount);
+            replNDlt = new TTLLoader(client, "nibdr",
+                    100000, 1024, 3, permits, partitionCount, "TTL");
             replNDlt.start();
+        }
+
+        // TTL/Migrate to Export
+        if (!config.disabledThreads.contains("partttlMigratelt")) {
+            partttlMigratelt = new TTLLoader(client, "ttlmigratep",
+                    100000, 1024, 50, permits, partitionCount, "EXPORT");
+            partttlMigratelt.start();
+        }
+
+        if (config.mpratio > 0.0 && !(config.disabledThreads.contains("replNDlt") || config.disabledThreads.contains("NDlt"))) {
+            replttlMigratelt = new TTLLoader(client, "ttlmigrater",
+                    100000, 1024, 3, permits, partitionCount, "EXPORT");
+            replttlMigratelt.start();
+        }
+
+
+        // Load a simple table and track scheduled TASK progress -- currently a time driven delete
+        if (!config.disabledThreads.contains("parttask")) {
+            partTasklt = new TaskLoader(client, "taskp", 100000, 1024, 50, permits, partitionCount);
+            partTasklt.start();
+        }
+
+        if (config.mpratio > 0.0 && !(config.disabledThreads.contains("repltask"))) {
+            replTasklt = new TaskLoader(client, "taskr", 100000, 1024, 3, permits, partitionCount);
+            replTasklt.start();
         }
 
         // print periodic statistics to the console
@@ -747,17 +774,23 @@ public class Benchmark {
                 adHocMayhemThread.start();
             }
         }
+
         if (!config.disabledThreads.contains("idpt")) {
             idpt = new InvokeDroppedProcedureThread(client);
             idpt.start();
-        } if (!config.disabledThreads.contains("ddlt")) {
+        }
+
+        if (!config.disabledThreads.contains("ddlt")) {
             ddlt = new DdlThread(client);
             // XXX/PSR ddlt.start();
         }
+
         if (!config.disabledThreads.contains("updateclasses")) {
             updcls = new UpdateClassesThread(client, config.duration);
             updcls.start();
         }
+
+
         log.info("All threads started...");
 
         while (true) {
@@ -783,37 +816,38 @@ public class Benchmark {
                 if (partBiglt != null) {
                     int lpcc = partBiglt.getPercentLoadComplete();
                     if (!partBiglt.isAlive() && lpcc < 100) {
-                        exitcode = reportDeadThread(partBiglt, " yet only " + Integer.toString(lpcc) + "% rows have been loaded");
+                        exitcode += reportDeadThread(partBiglt, " yet only " + Integer.toString(lpcc) + "% rows have been loaded");
                     } else
                         log.info(partBiglt + " was at " + lpcc + "% of rows loaded");
                 } if (replBiglt != null) {
                     int lpcc = replBiglt.getPercentLoadComplete();
                     if (!replBiglt.isAlive() && lpcc < 100) {
-                        exitcode = reportDeadThread(replBiglt, " yet only " + Integer.toString(lpcc) + "% rows have been loaded");
+                        exitcode += reportDeadThread(replBiglt, " yet only " + Integer.toString(lpcc) + "% rows have been loaded");
                     } else
                         log.info(replBiglt + " was at " + lpcc + "% of rows loaded");
                 }
                 // check if all threads still alive
                 if (partTrunclt != null && !partTrunclt.isAlive())
-                    exitcode = reportDeadThread(partTrunclt);
+                    exitcode += reportDeadThread(partTrunclt);
                 if (replTrunclt != null && !replTrunclt.isAlive())
-                    exitcode = reportDeadThread(replTrunclt);
+                    exitcode += reportDeadThread(replTrunclt);
+
                 /* XXX if (! partLoadlt.isAlive())
                     exitcode = reportDeadThread(partLoadlt);
                 if (! replLoadlt.isAlive())
                     exitcode = reportDeadThread(replLoadlt);
                 */
                 if (readThread != null && !readThread.isAlive())
-                    exitcode = reportDeadThread(readThread);
+                    exitcode += reportDeadThread(readThread);
                 if (adHocMayhemThread != null && !config.disableadhoc && !adHocMayhemThread.isAlive())
-                    exitcode = reportDeadThread(adHocMayhemThread);
+                    exitcode += reportDeadThread(adHocMayhemThread);
                 if (idpt != null && !idpt.isAlive())
-                    exitcode = reportDeadThread(idpt);
+                    exitcode += reportDeadThread(idpt);
                 /* XXX if (! ddlt.isAlive())
                     exitcode = reportDeadThread(ddlt);*/
                 for (ClientThread ct : clientThreads) {
                     if (!ct.isAlive()) {
-                        exitcode = reportDeadThread(ct);
+                        exitcode += reportDeadThread(ct);
                     }
                 }
                 /*
@@ -860,7 +894,7 @@ public class Benchmark {
                 long count = txnCount.get();
                 log.info("Client thread transaction count: " + count + "\n");
                 if (exitcode > 0 && txnCount.get() == 0) {
-                    System.err.println("Shutting down, but found that no work was done.");
+                    System.err.println("Shutting down, but found that no work was done. Exit code: " + exitcode);
                     exitcode = 2;
                 }
                 System.exit(exitcode);

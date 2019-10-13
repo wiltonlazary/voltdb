@@ -23,6 +23,8 @@
 
 package org.voltdb.regressionsuites;
 
+import static org.junit.Assert.assertNotEquals;
+
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -34,6 +36,10 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.PrintStream;
 import java.io.UnsupportedEncodingException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -56,6 +62,7 @@ import org.junit.Test;
 import org.voltcore.logging.VoltLogger;
 import org.voltcore.zk.ZKUtil;
 import org.voltdb.BackendTarget;
+import org.voltdb.ClientResponseImpl;
 import org.voltdb.DefaultSnapshotDataTarget;
 import org.voltdb.FlakyTestRule;
 import org.voltdb.FlakyTestRule.Flaky;
@@ -87,7 +94,6 @@ import org.voltdb.utils.SnapshotVerifier;
 import org.voltdb.utils.VoltFile;
 
 import com.google_voltpatches.common.collect.Sets;
-import com.google_voltpatches.common.io.Files;
 
 /**
  * Test the SnapshotSave and SnapshotRestore system procedures
@@ -657,13 +663,12 @@ public class TestSaveRestoreSysprocSuite extends SaveRestoreBase {
             lc.shutDown();
         }
 
-        //Copy over snapshot data from removed node
-        for (File f : lc.getPathInSubroots(new File(TMPDIR))[1].listFiles()) {
-            if (f.getName().startsWith(TESTNONCE)) {
-                File dest = new File(lc.getPathInSubroots(new File(TMPDIR))[0], f.getName());
-                System.out.println("Copying " + f.getPath() + " to " + dest.getPath());
-                Files.copy(f, dest);
-            }
+        // Copy over snapshot data from removed node
+        Path[] dirs = lc.getPathInSubroots(TMPDIR);
+        for (Path p : Files.newDirectoryStream(dirs[1], TESTNONCE + "*")) {
+            Path dest = dirs[0].resolve(p.getFileName());
+            System.out.println("Copying " + p + " to " + dest);
+            Files.copy(p, dest, StandardCopyOption.REPLACE_EXISTING);
         }
 
         // Restore snapshot to 1 nodes 1 sites/host cluster.
@@ -750,12 +755,11 @@ public class TestSaveRestoreSysprocSuite extends SaveRestoreBase {
 
         System.out.println("testRestoreWithGhostPartitionAndJoin - Copy over snapshot data from removed node");
         //Copy over snapshot data from removed node
-        for (File f : lc.getPathInSubroots(new File(TMPDIR))[1].listFiles()) {
-            if (f.getName().startsWith(TESTNONCE)) {
-                File dest = new File(lc.getPathInSubroots(new File(TMPDIR))[0], f.getName());
-                System.out.println("Copying " + f.getPath() + " to " + dest.getPath());
-                Files.copy(f, dest);
-            }
+        Path[] dirs = lc.getPathInSubroots(TMPDIR);
+        for (Path p : Files.newDirectoryStream(dirs[1], TESTNONCE + "*")) {
+            Path dest = dirs[0].resolve(p.getFileName());
+            System.out.println("Copying " + p + " to " + dest);
+            Files.copy(p, dest, StandardCopyOption.REPLACE_EXISTING);
         }
 
         // Restore snapshot to 1 nodes 1 sites/host cluster.
@@ -1393,19 +1397,18 @@ public class TestSaveRestoreSysprocSuite extends SaveRestoreBase {
         assertEquals(0, proc.waitFor());
         validateSnapshot(true, false, TESTNONCE);
 
-        byte firstStringBytes[] = new byte[1048576];
-        java.util.Arrays.fill(firstStringBytes, (byte)'c');
-        byte secondStringBytes[] = new byte[1048564];
-        java.util.Arrays.fill(secondStringBytes, (byte)'a');
-
         try {
             client.callProcedure("@SnapshotRestore", TMPDIR + "x", TESTNONCE);
-        } catch(Exception ex) {
-            System.err.println(ex.getMessage());
-            assertTrue(ex.getMessage().contains("Output path for Json duplicatesPath"));
-            assertTrue(ex.getMessage().contains("does not exist") || ex.getMessage().contains("is not executable"));
+        } catch (ProcCallException ex) {
+            System.err.println(((ClientResponseImpl) ex.getClientResponse()).toJSONString());
+            assertEquals("Restore failed to complete. See response table for additional info.", ex.getMessage());
+            VoltTable table = ex.getClientResponse().getResults()[0];
+            String tableString = table.toString();
+            assertTrue(tableString, table.advanceRow());
+            assertTrue(tableString, table.getString(1).contains("No snapshot related digests files found"));
+            assertTrue(tableString, table.advanceRow());
+            assertTrue(tableString, table.getString(1).contains("does not exist"));
         }
-
     }
 
     @Test
@@ -3408,9 +3411,24 @@ public class TestSaveRestoreSysprocSuite extends SaveRestoreBase {
                 assertEquals(2000, reptableRows);
                 long parttableRows = client.callProcedure("@AdHoc", "select count(*) from PARTITION_TESTER").getResults()[0].asScalarLong();
                 assertEquals(252, parttableRows);
+
+                saveTablesWithPath(client, TESTNONCE + 2, snapshotsPath);
             } finally {
                 client.close();
             }
+
+            // ENG-16548 Validate that the digest is the same size for all snapshots
+            Path snapshotDir = Paths.get(snapshotsPath);
+            long referenceSize = -1;
+            for (Path file : Files.newDirectoryStream(snapshotDir, "*.digest")) {
+                long size = Files.size(file);
+                if (referenceSize < 0) {
+                    referenceSize = size;
+                } else {
+                    assertEquals(referenceSize, size);
+                }
+            }
+            assertNotEquals(-1, referenceSize);
 
         } finally {
             lc.shutDown();

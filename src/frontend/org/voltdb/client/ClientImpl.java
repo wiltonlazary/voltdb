@@ -21,7 +21,6 @@ import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.net.UnknownHostException;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
@@ -47,8 +46,6 @@ import org.voltdb.client.VoltBulkLoader.BulkLoaderSuccessCallback;
 import org.voltdb.client.VoltBulkLoader.VoltBulkLoader;
 import org.voltdb.common.Constants;
 import org.voltdb.utils.Encoder;
-
-import com.google_voltpatches.common.collect.ImmutableSet;
 
 import io.netty.handler.ssl.SslContext;
 
@@ -229,9 +226,7 @@ public final class ClientImpl implements Client {
             String host,
             int port,
             String program,
-            byte[] hashedPassword)
-                    throws IOException
-    {
+            byte[] hashedPassword) throws IOException {
         if (m_isShutdown) {
             throw new IOException("Client instance is shutdown");
         }
@@ -255,10 +250,9 @@ public final class ClientImpl implements Client {
      */
     @Override
     public final ClientResponse callProcedure(String procName, Object... parameters)
-            throws IOException, NoConnectionsException, ProcCallException
-    {
-        return callProcedureWithClientTimeout(BatchTimeoutOverrideType.NO_TIMEOUT, false,
-                procName, Distributer.USE_DEFAULT_CLIENT_TIMEOUT, TimeUnit.SECONDS, parameters);
+            throws IOException, NoConnectionsException, ProcCallException {
+        return callProcedureWithClientTimeoutImpl(BatchTimeoutOverrideType.NO_TIMEOUT, procName,
+                Distributer.USE_DEFAULT_CLIENT_TIMEOUT, TimeUnit.SECONDS, parameters);
     }
 
     /**
@@ -274,9 +268,7 @@ public final class ClientImpl implements Client {
     public ClientResponse callProcedureWithTimeout(
             int batchTimeout,
             String procName,
-            Object... parameters)
-                    throws IOException, NoConnectionsException, ProcCallException
-    {
+            Object... parameters) throws IOException, NoConnectionsException, ProcCallException {
         return callProcedureWithClientTimeout(batchTimeout, procName,
                 Distributer.USE_DEFAULT_CLIENT_TIMEOUT, TimeUnit.SECONDS, parameters);
     }
@@ -289,10 +281,8 @@ public final class ClientImpl implements Client {
             String procName,
             long clientTimeout,
             TimeUnit unit,
-            Object... parameters)
-                    throws IOException, NoConnectionsException, ProcCallException
-    {
-        return callProcedureWithClientTimeout(batchTimeout, false, procName, clientTimeout, unit, parameters);
+            Object... parameters) throws IOException, ProcCallException {
+        return callProcedureWithClientTimeoutImpl(batchTimeout, procName, clientTimeout, unit, parameters);
     }
 
     /**
@@ -308,18 +298,15 @@ public final class ClientImpl implements Client {
      * @throws org.voltdb.client.ProcCallException
      * @throws NoConnectionsException
      */
-    public ClientResponse callProcedureWithClientTimeout(
+    protected ClientResponse callProcedureWithClientTimeoutImpl(
             int batchTimeout,
-            boolean allPartition,
             String procName,
             long clientTimeout,
             TimeUnit unit,
-            Object... parameters)
-                    throws IOException, NoConnectionsException, ProcCallException
-    {
+            Object... parameters) throws IOException, NoConnectionsException, ProcCallException {
         long handle = m_handle.getAndIncrement();
         ProcedureInvocation invocation
-            = new ProcedureInvocation(handle, batchTimeout, allPartition, procName, parameters);
+                = new ProcedureInvocation(handle, batchTimeout, -1, procName, parameters);
         long nanos = unit.toNanos(clientTimeout);
         return internalSyncCallProcedure(nanos, invocation);
     }
@@ -335,9 +322,7 @@ public final class ClientImpl implements Client {
     public final boolean callProcedure(
             ProcedureCallback callback,
             String procName,
-            Object... parameters)
-                    throws IOException, NoConnectionsException
-    {
+            Object... parameters) throws IOException {
         //Time unit doesn't matter in this case since the timeout isn't being specified
         return callProcedureWithClientTimeout(callback, BatchTimeoutOverrideType.NO_TIMEOUT, procName,
                 Distributer.USE_DEFAULT_CLIENT_TIMEOUT, TimeUnit.NANOSECONDS, parameters);
@@ -356,14 +341,12 @@ public final class ClientImpl implements Client {
             ProcedureCallback callback,
             int batchTimeout,
             String procName,
-            Object... parameters)
-                    throws IOException, NoConnectionsException
-    {
+            Object... parameters) throws IOException {
         //Time unit doesn't matter in this case since the timeout isn't being specifie
         return callProcedureWithClientTimeout(
                 callback,
                 batchTimeout,
-                false,
+                -1,
                 procName,
                 Distributer.USE_DEFAULT_CLIENT_TIMEOUT,
                 TimeUnit.NANOSECONDS,
@@ -379,11 +362,9 @@ public final class ClientImpl implements Client {
             String procName,
             long clientTimeout,
             TimeUnit clientTimeoutUnit,
-            Object... parameters)
-                    throws IOException, NoConnectionsException
-    {
+            Object... parameters) throws IOException {
         return callProcedureWithClientTimeout(
-                callback, batchTimeout, false, procName, clientTimeout, clientTimeoutUnit, parameters);
+                callback, batchTimeout, -1, procName, clientTimeout, clientTimeoutUnit, parameters);
     }
 
     /**
@@ -401,20 +382,18 @@ public final class ClientImpl implements Client {
     public boolean callProcedureWithClientTimeout(
             ProcedureCallback callback,
             int batchTimeout,
-            boolean allPartition,
+            int partitionDestination,
             String procName,
             long clientTimeout,
             TimeUnit clientTimeoutUnit,
-            Object... parameters)
-                    throws IOException, NoConnectionsException
-    {
+            Object... parameters) throws IOException {
         if (callback instanceof ProcedureArgumentCacher) {
             ((ProcedureArgumentCacher) callback).setArgs(parameters);
         }
 
         long handle = m_handle.getAndIncrement();
         ProcedureInvocation invocation
-                = new ProcedureInvocation(handle, batchTimeout, allPartition, procName, parameters);
+                = new ProcedureInvocation(handle, batchTimeout, partitionDestination, procName, parameters);
 
         if (m_isShutdown) {
             return false;
@@ -431,8 +410,7 @@ public final class ClientImpl implements Client {
     @Override
     public int calculateInvocationSerializedSize(
             String procName,
-            Object... parameters)
-    {
+            Object... parameters) {
         final ProcedureInvocation invocation =
             new ProcedureInvocation(0, procName, parameters);
         return invocation.getSerializedSize();
@@ -444,9 +422,7 @@ public final class ClientImpl implements Client {
            ProcedureCallback callback,
            int expectedSerializedSize,
            String procName,
-           Object... parameters)
-                   throws NoConnectionsException, IOException
-    {
+           Object... parameters) throws IOException {
         return callProcedure(callback, procName, parameters);
     }
 
@@ -490,8 +466,7 @@ public final class ClientImpl implements Client {
     private final boolean internalAsyncCallProcedure(
             ProcedureCallback callback,
             long clientTimeoutNanos,
-            ProcedureInvocation invocation)
-            throws IOException, NoConnectionsException {
+            ProcedureInvocation invocation) throws IOException {
         assert( ! m_isShutdown);
         assert(callback != null);
 
@@ -564,7 +539,7 @@ public final class ClientImpl implements Client {
 
     @Override
     public ClientResponse updateApplicationCatalog(File catalogPath, File deploymentPath)
-    throws IOException, NoConnectionsException, ProcCallException {
+    throws IOException, ProcCallException {
         Object[] params = getUpdateCatalogParams(catalogPath, deploymentPath);
         return callProcedure("@UpdateApplicationCatalog", params);
     }
@@ -572,16 +547,14 @@ public final class ClientImpl implements Client {
     @Override
     public boolean updateApplicationCatalog(ProcedureCallback callback,
                                             File catalogPath,
-                                            File deploymentPath)
-    throws IOException, NoConnectionsException {
+                                            File deploymentPath) throws IOException {
         Object[] params = getUpdateCatalogParams(catalogPath, deploymentPath);
         return callProcedure(callback, "@UpdateApplicationCatalog", params);
     }
 
     @Override
     public ClientResponse updateClasses(File jarPath, String classesToDelete)
-    throws IOException, NoConnectionsException, ProcCallException
-    {
+    throws IOException, ProcCallException {
         byte[] jarbytes = null;
         if (jarPath != null) {
             jarbytes = ClientUtils.fileToBytes(jarPath);
@@ -592,9 +565,7 @@ public final class ClientImpl implements Client {
     @Override
     public boolean updateClasses(ProcedureCallback callback,
                                  File jarPath,
-                                 String classesToDelete)
-    throws IOException, NoConnectionsException
-    {
+                                 String classesToDelete) throws IOException {
         byte[] jarbytes = null;
         if (jarPath != null) {
             jarbytes = ClientUtils.fileToBytes(jarPath);
@@ -636,10 +607,10 @@ public final class ClientImpl implements Client {
         }
 
         if (m_ex != null) {
-            m_ex.shutdown();
             if (CoreUtils.isJunitTest()) {
-                m_ex.awaitTermination(1, TimeUnit.SECONDS);
+                m_ex.shutdownNow();
             } else {
+                m_ex.shutdown();
                 m_ex.awaitTermination(365, TimeUnit.DAYS);
             }
         }
@@ -728,7 +699,6 @@ public final class ClientImpl implements Client {
 
         boolean m_useAdminPort = false;
         boolean m_adminPortChecked = false;
-        boolean m_connectionSuccess = false;
         AtomicInteger connectionTaskCount = new AtomicInteger(0);
         @Override
         public void backpressure(boolean status) {
@@ -943,7 +913,7 @@ public final class ClientImpl implements Client {
     }
 
     @Override
-    public void createConnection(String host) throws UnknownHostException, IOException {
+    public void createConnection(String host) throws IOException {
         if (m_username == null) {
             throw new IllegalStateException("Attempted to use createConnection(String host) " +
                     "with a client that wasn't constructed with a username and password specified");
@@ -954,7 +924,7 @@ public final class ClientImpl implements Client {
     }
 
     @Override
-    public void createConnection(String host, int port) throws UnknownHostException, IOException {
+    public void createConnection(String host, int port) throws IOException {
         if (m_username == null) {
             throw new IllegalStateException("Attempted to use createConnection(String host) " +
                     "with a client that wasn't constructed with a username and password specified");
@@ -1046,7 +1016,7 @@ public final class ClientImpl implements Client {
 
     @Override
     public ClientResponseWithPartitionKey[] callAllPartitionProcedure(String procedureName, Object... params)
-            throws IOException, NoConnectionsException, ProcCallException {
+            throws IOException, ProcCallException {
         CountDownLatch latch = new CountDownLatch(1);
         SyncAllPartitionProcedureCallback callBack = new SyncAllPartitionProcedureCallback(latch);
         callAllPartitionProcedure(callBack, procedureName, params);
@@ -1060,7 +1030,7 @@ public final class ClientImpl implements Client {
 
     @Override
     public boolean callAllPartitionProcedure(AllPartitionProcedureCallback callback, String procedureName,
-            Object... params) throws IOException, NoConnectionsException, ProcCallException {
+            Object... params) throws IOException, ProcCallException {
         if (callback == null) {
             throw new IllegalArgumentException("AllPartitionProcedureCallback can not be null");
         }
@@ -1068,19 +1038,20 @@ public final class ClientImpl implements Client {
         Object[] args = new Object[params.length + 1];
         System.arraycopy(params, 0, args, 1, params.length);
 
-        final ImmutableSet<Integer> partitionSet = m_distributer.getPartitionKeys();
-        int partitionCount = partitionSet.size();
+        final Map<Integer, Integer> partitionMap = m_distributer.getPartitionKeys();
+        int partitionCount = partitionMap.size();
         AtomicInteger counter = new AtomicInteger(partitionCount);
         assert(partitionCount > 0);
         ClientResponseWithPartitionKey[] responses = new ClientResponseWithPartitionKey[partitionCount];
-        for (Integer key : partitionSet) {
-            args[0] = key;
+        for (Map.Entry<Integer, Integer> entry : partitionMap.entrySet()) {
+            args[0] = entry.getValue();
             partitionCount--;
-            OnePartitionProcedureCallback cb = new OnePartitionProcedureCallback(counter, key, partitionCount, responses, callback);
+            OnePartitionProcedureCallback cb = new OnePartitionProcedureCallback(counter, args[0], partitionCount,
+                    responses, callback);
             try {
                 // Call the more complex method to ensure that the allPartition flag for the invocation is
                 // set to true. This gives a nice error message if the target procedure is incompatible.
-                if (!callProcedureWithClientTimeout(cb, BatchTimeoutOverrideType.NO_TIMEOUT, true,
+                if (!callProcedureWithClientTimeout(cb, BatchTimeoutOverrideType.NO_TIMEOUT, entry.getKey(),
                         procedureName, Distributer.USE_DEFAULT_CLIENT_TIMEOUT, TimeUnit.NANOSECONDS, args))
                 {
                     final ClientResponse r = new ClientResponseImpl(ClientResponse.GRACEFUL_FAILURE, new VoltTable[0],

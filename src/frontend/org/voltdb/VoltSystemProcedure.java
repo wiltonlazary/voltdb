@@ -117,6 +117,21 @@ public abstract class VoltSystemProcedure extends VoltProcedure {
      */
     abstract public long[] getPlanFragmentIds();
 
+    /**
+     * return all SysProc plan fragments that needs to be registered
+     * These fragments will be replayed in rejoining process.
+     */
+    public long[] getAllowableSysprocFragIdsInTaskLog() {
+        return new long[]{};
+    }
+
+    /**
+     * @return true if the procedure should not be skipped from TaskLog replay
+     */
+    public boolean allowableSysprocForTaskLog() {
+        return false;
+    }
+
     /** Bundles the data needed to describe a plan fragment. */
     public static class SynthesizedPlanFragment {
         public long siteId = -1;
@@ -238,7 +253,6 @@ public abstract class VoltSystemProcedure extends VoltProcedure {
         MpTransactionState txnState = (MpTransactionState)m_runner.getTxnState();
         assert(txnState != null);
 
-        int fragmentIndex = 0;
         for (SynthesizedPlanFragment pf : pfs) {
             assert (pf.parameters != null);
 
@@ -256,13 +270,11 @@ public abstract class VoltSystemProcedure extends VoltProcedure {
                     txnState.isNPartTxn(),
                     txnState.getTimetamp());
 
-            //During @MigratePartitionLeader, a fragment may be mis-routed. fragmentIndex is used to check which fragment is mis-routed and
-            //to determine how the follow-up fragments are processed.
-            task.setBatch(fragmentIndex++);
             task.setFragmentTaskType(FragmentTaskMessage.SYS_PROC_PER_SITE);
 
             if (pf.multipartition) {
                 // create a workunit for every execution site
+                task.setBatch(txnState.getNextFragmentIndex());
                 txnState.createAllParticipatingFragmentWork(task);
             } else {
                 // create one workunit for the current site

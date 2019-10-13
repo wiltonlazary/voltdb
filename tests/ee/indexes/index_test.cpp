@@ -71,8 +71,6 @@
 #include "indexes/tableindexfactory.h"
 #include "execution/VoltDBEngine.h"
 #include "common/ThreadLocalPool.h"
-#include "common/FixUnusedAssertHack.h"
-
 
 using namespace std;
 using namespace voltdb;
@@ -105,8 +103,8 @@ public:
         vector<boost::shared_ptr<const TableColumn> > columns;
         vector<string> columnNames(num_of_columns);
 
-        vector<ValueType> columnTypes(num_of_columns, VALUE_TYPE_BIGINT);
-        vector<int32_t> columnLengths(num_of_columns, NValue::getTupleStorageSize(VALUE_TYPE_BIGINT));
+        vector<ValueType> columnTypes(num_of_columns, ValueType::tBIGINT);
+        vector<int32_t> columnLengths(num_of_columns, NValue::getTupleStorageSize(ValueType::tBIGINT));
         vector<bool> columnAllowNull(num_of_columns, false);
 
         char buffer[32];
@@ -286,10 +284,10 @@ public:
         vector<string> columnNames(NUM_OF_COLUMNS);
 
         char buffer[32];
-        vector<ValueType> columnTypes(NUM_OF_COLUMNS, VALUE_TYPE_BIGINT);
+        vector<ValueType> columnTypes(NUM_OF_COLUMNS, ValueType::tBIGINT);
         vector<int32_t>
             columnLengths(NUM_OF_COLUMNS,
-                          NValue::getTupleStorageSize(VALUE_TYPE_BIGINT));
+                          NValue::getTupleStorageSize(ValueType::tBIGINT));
         vector<bool> columnAllowNull(NUM_OF_COLUMNS, false);
         for (int ctr = 0; ctr < NUM_OF_COLUMNS; ctr++)
         {
@@ -320,7 +318,8 @@ public:
         m_engine->initialize(0, 0, 0, partitionCount, 0, "", 0, 1024, DEFAULT_TEMP_TABLE_MEMORY, true);
         partitionCount = htonl(partitionCount);
         m_engine->updateHashinator((char*)&partitionCount, NULL, 0);
-        table = dynamic_cast<PersistentTable*>(TableFactory::getPersistentTable(database_id, (const string)"test_table", schema, columnNames, signature));
+        table = dynamic_cast<PersistentTable*>(TableFactory::getPersistentTable(database_id,
+                    "test_table", schema, columnNames, signature));
 
         TableIndex *pkeyIndex = TableIndexFactory::TableIndexFactory::getInstance(pkeyScheme);
         assert(pkeyIndex);
@@ -342,7 +341,7 @@ public:
             tuple.setNValue(2, ValueFactory::getBigIntValue(i % 3));
             tuple.setNValue(3, ValueFactory::getBigIntValue(i + 20));
             tuple.setNValue(4, ValueFactory::getBigIntValue(i * 11));
-            assert(true == table->insertTuple(tuple));
+            vassert(table->insertTuple(tuple));
         }
     }
 
@@ -400,7 +399,7 @@ TEST_F(IndexTest, IntUnique) {
     vector<int> iu_column_indices;
     vector<ValueType> iu_column_types;
     iu_column_indices.push_back(3);
-    iu_column_types.push_back(VALUE_TYPE_BIGINT);
+    iu_column_types.push_back(ValueType::tBIGINT);
 
     init("iu",
          BALANCED_TREE_INDEX,
@@ -419,7 +418,7 @@ TEST_F(IndexTest, IntMulti) {
     vector<int> im_column_indices;
     vector<ValueType> im_column_types;
     im_column_indices.push_back(3);
-    im_column_types.push_back(VALUE_TYPE_BIGINT);
+    im_column_types.push_back(ValueType::tBIGINT);
     init("im",
          BALANCED_TREE_INDEX,
          im_column_indices,
@@ -437,8 +436,8 @@ TEST_F(IndexTest, IntsUnique) {
     vector<ValueType> ixu_column_types;
     ixu_column_indices.push_back(4);
     ixu_column_indices.push_back(2);
-    ixu_column_types.push_back(VALUE_TYPE_BIGINT);
-    ixu_column_types.push_back(VALUE_TYPE_BIGINT);
+    ixu_column_types.push_back(ValueType::tBIGINT);
+    ixu_column_types.push_back(ValueType::tBIGINT);
     init("ixu",
          BALANCED_TREE_INDEX,
          ixu_column_indices,
@@ -453,9 +452,9 @@ TEST_F(IndexTest, IntsUnique) {
     //EXPECT_EQ(62520, index->getMemoryEstimate());
 
     TableTuple tuple(table->schema());
-    vector<ValueType> keyColumnTypes(2, VALUE_TYPE_BIGINT);
+    vector<ValueType> keyColumnTypes(2, ValueType::tBIGINT);
     vector<int32_t>
-        keyColumnLengths(2, NValue::getTupleStorageSize(VALUE_TYPE_BIGINT));
+        keyColumnLengths(2, NValue::getTupleStorageSize(ValueType::tBIGINT));
     vector<bool> keyColumnAllowNull(2, true);
     TupleSchema* keySchema =
         TupleSchema::createTupleSchemaForTest(keyColumnTypes,
@@ -583,11 +582,9 @@ TEST_F(IndexTest, IntsUnique) {
     tmptuple.
         setNValue(4, ValueFactory::getBigIntValue(static_cast<int64_t>(550)));
     bool exceptionThrown = false;
-    try
-    {
+    try {
         EXPECT_EQ(false, table->insertTuple(tmptuple));
-    }
-    catch (SerializableEEException &e)
+    } catch (SerializableEEException &e)
     {
         exceptionThrown = true;
     }
@@ -601,8 +598,8 @@ TEST_F(IndexTest, IntsMulti) {
     vector<ValueType> ixm_column_types;
     ixm_column_indices.push_back(4);
     ixm_column_indices.push_back(2);
-    ixm_column_types.push_back(VALUE_TYPE_BIGINT);
-    ixm_column_types.push_back(VALUE_TYPE_BIGINT);
+    ixm_column_types.push_back(ValueType::tBIGINT);
+    ixm_column_types.push_back(ValueType::tBIGINT);
     init("ixm2",
          BALANCED_TREE_INDEX,
          ixm_column_indices,
@@ -616,9 +613,9 @@ TEST_F(IndexTest, IntsMulti) {
     //EXPECT_EQ(52000, index->getMemoryEstimate());
 
     TableTuple tuple(table->schema());
-    vector<ValueType> keyColumnTypes(2, VALUE_TYPE_BIGINT);
+    vector<ValueType> keyColumnTypes(2, ValueType::tBIGINT);
     vector<int32_t>
-        keyColumnLengths(2, NValue::getTupleStorageSize(VALUE_TYPE_BIGINT));
+        keyColumnLengths(2, NValue::getTupleStorageSize(ValueType::tBIGINT));
     vector<bool> keyColumnAllowNull(2, true);
     TupleSchema* keySchema =
         TupleSchema::createTupleSchemaForTest(keyColumnTypes,
@@ -756,8 +753,8 @@ TEST_F(IndexTest, TupleKeyUnique) {
     // make a tuple with the index key schema
     int indexWidth = 40;
     vector<bool> keyColumnAllowNull(indexWidth, true);
-    vector<ValueType> keyColumnTypes(indexWidth, VALUE_TYPE_BIGINT);
-    vector<int32_t> keyColumnLengths(indexWidth, NValue::getTupleStorageSize(VALUE_TYPE_BIGINT));
+    vector<ValueType> keyColumnTypes(indexWidth, ValueType::tBIGINT);
+    vector<int32_t> keyColumnLengths(indexWidth, NValue::getTupleStorageSize(ValueType::tBIGINT));
     TupleSchema *keySchema = TupleSchema::createTupleSchemaForTest(keyColumnTypes, keyColumnLengths, keyColumnAllowNull);
     TableTuple searchkey(keySchema);
     // provide storage for search key tuple
@@ -833,8 +830,8 @@ TEST_F(IndexTest, ReentrantTreeUnique) {
     vector<ValueType> ixu_column_types;
     ixu_column_indices.push_back(4);
     ixu_column_indices.push_back(2);
-    ixu_column_types.push_back(VALUE_TYPE_BIGINT);
-    ixu_column_types.push_back(VALUE_TYPE_BIGINT);
+    ixu_column_types.push_back(ValueType::tBIGINT);
+    ixu_column_types.push_back(ValueType::tBIGINT);
     init("ixu",
             BALANCED_TREE_INDEX,
             ixu_column_indices,
@@ -847,9 +844,9 @@ TEST_F(IndexTest, ReentrantTreeUnique) {
     IndexCursor indexCursor(index->getTupleSchema());
 
     TableTuple tuple(table->schema());
-    vector<ValueType> keyColumnTypes(2, VALUE_TYPE_BIGINT);
+    vector<ValueType> keyColumnTypes(2, ValueType::tBIGINT);
     vector<int32_t>
-    keyColumnLengths(2, NValue::getTupleStorageSize(VALUE_TYPE_BIGINT));
+    keyColumnLengths(2, NValue::getTupleStorageSize(ValueType::tBIGINT));
     vector<bool> keyColumnAllowNull(2, true);
     TupleSchema* keySchema =
             TupleSchema::createTupleSchemaForTest(keyColumnTypes,
@@ -923,8 +920,8 @@ TEST_F(IndexTest, ReentrantTreeMultiple) {
     vector<ValueType> ixm_column_types;
     ixm_column_indices.push_back(4);
     ixm_column_indices.push_back(2);
-    ixm_column_types.push_back(VALUE_TYPE_BIGINT);
-    ixm_column_types.push_back(VALUE_TYPE_BIGINT);
+    ixm_column_types.push_back(ValueType::tBIGINT);
+    ixm_column_types.push_back(ValueType::tBIGINT);
     init("ixm2",
          BALANCED_TREE_INDEX,
          ixm_column_indices,
@@ -936,8 +933,8 @@ TEST_F(IndexTest, ReentrantTreeMultiple) {
     IndexCursor indexCursor(index->getTupleSchema());
 
     TableTuple tuple(table->schema());
-    vector<ValueType> keyColumnTypes(2, VALUE_TYPE_BIGINT);
-    vector<int32_t>keyColumnLengths(2, NValue::getTupleStorageSize(VALUE_TYPE_BIGINT));
+    vector<ValueType> keyColumnTypes(2, ValueType::tBIGINT);
+    vector<int32_t>keyColumnLengths(2, NValue::getTupleStorageSize(ValueType::tBIGINT));
     vector<bool> keyColumnAllowNull(2, true);
     TupleSchema* keySchema =
         TupleSchema::createTupleSchemaForTest(keyColumnTypes,
@@ -1009,8 +1006,8 @@ TEST_F(IndexTest, ReentrantHashUnique) {
     vector<ValueType> ixm_column_types;
     ixm_column_indices.push_back(4);
     ixm_column_indices.push_back(2);
-    ixm_column_types.push_back(VALUE_TYPE_BIGINT);
-    ixm_column_types.push_back(VALUE_TYPE_BIGINT);
+    ixm_column_types.push_back(ValueType::tBIGINT);
+    ixm_column_types.push_back(ValueType::tBIGINT);
     init("ixh1",
          HASH_TABLE_INDEX,
          ixm_column_indices,
@@ -1022,8 +1019,8 @@ TEST_F(IndexTest, ReentrantHashUnique) {
     IndexCursor indexCursor(index->getTupleSchema());
 
     TableTuple tuple(table->schema());
-    vector<ValueType> keyColumnTypes(2, VALUE_TYPE_BIGINT);
-    vector<int32_t>keyColumnLengths(2, NValue::getTupleStorageSize(VALUE_TYPE_BIGINT));
+    vector<ValueType> keyColumnTypes(2, ValueType::tBIGINT);
+    vector<int32_t>keyColumnLengths(2, NValue::getTupleStorageSize(ValueType::tBIGINT));
     vector<bool> keyColumnAllowNull(2, true);
     TupleSchema* keySchema =
         TupleSchema::createTupleSchemaForTest(keyColumnTypes,
@@ -1065,8 +1062,8 @@ TEST_F(IndexTest, ReentrantHashMultiple) {
     vector<ValueType> ixm_column_types;
     ixm_column_indices.push_back(4);
     ixm_column_indices.push_back(2);
-    ixm_column_types.push_back(VALUE_TYPE_BIGINT);
-    ixm_column_types.push_back(VALUE_TYPE_BIGINT);
+    ixm_column_types.push_back(ValueType::tBIGINT);
+    ixm_column_types.push_back(ValueType::tBIGINT);
     init("ixh2",
          HASH_TABLE_INDEX,
          ixm_column_indices,
@@ -1078,8 +1075,8 @@ TEST_F(IndexTest, ReentrantHashMultiple) {
     IndexCursor indexCursor(index->getTupleSchema());
 
     TableTuple tuple(table->schema());
-    vector<ValueType> keyColumnTypes(2, VALUE_TYPE_BIGINT);
-    vector<int32_t>keyColumnLengths(2, NValue::getTupleStorageSize(VALUE_TYPE_BIGINT));
+    vector<ValueType> keyColumnTypes(2, ValueType::tBIGINT);
+    vector<int32_t>keyColumnLengths(2, NValue::getTupleStorageSize(ValueType::tBIGINT));
     vector<bool> keyColumnAllowNull(2, true);
     TupleSchema* keySchema =
         TupleSchema::createTupleSchemaForTest(keyColumnTypes,

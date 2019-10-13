@@ -16,7 +16,6 @@
  */
 
 #include "stats/StatsSource.h"
-
 #include "common/executorcontext.hpp"
 #include "storage/table.h"
 #include "storage/temptable.h"
@@ -37,11 +36,30 @@ vector<string> StatsSource::generateBaseStatsColumnNames() {
 
 void StatsSource::populateBaseSchema(vector<ValueType> &types, vector<int32_t> &columnLengths,
         vector<bool> &allowNull, vector<bool> &inBytes) {
-    types.push_back(VALUE_TYPE_BIGINT); columnLengths.push_back(NValue::getTupleStorageSize(VALUE_TYPE_BIGINT)); allowNull.push_back(false);inBytes.push_back(false);
-    types.push_back(VALUE_TYPE_INTEGER); columnLengths.push_back(NValue::getTupleStorageSize(VALUE_TYPE_INTEGER)); allowNull.push_back(false);inBytes.push_back(false);
-    types.push_back(VALUE_TYPE_VARCHAR); columnLengths.push_back(4096); allowNull.push_back(false);inBytes.push_back(false);
-    types.push_back(VALUE_TYPE_INTEGER); columnLengths.push_back(NValue::getTupleStorageSize(VALUE_TYPE_INTEGER)); allowNull.push_back(false);inBytes.push_back(false);
-    types.push_back(VALUE_TYPE_BIGINT); columnLengths.push_back(NValue::getTupleStorageSize(VALUE_TYPE_BIGINT)); allowNull.push_back(false);inBytes.push_back(false);
+    types.push_back(ValueType::tBIGINT);
+    columnLengths.push_back(NValue::getTupleStorageSize(ValueType::tBIGINT));
+    allowNull.push_back(false);
+    inBytes.push_back(false);
+
+    types.push_back(ValueType::tINTEGER);
+    columnLengths.push_back(NValue::getTupleStorageSize(ValueType::tINTEGER));
+    allowNull.push_back(false);
+    inBytes.push_back(false);
+
+    types.push_back(ValueType::tVARCHAR);
+    columnLengths.push_back(4096);
+    allowNull.push_back(false);
+    inBytes.push_back(false);
+
+    types.push_back(ValueType::tINTEGER);
+    columnLengths.push_back(NValue::getTupleStorageSize(ValueType::tINTEGER));
+    allowNull.push_back(false);
+    inBytes.push_back(false);
+
+    types.push_back(ValueType::tBIGINT);
+    columnLengths.push_back(NValue::getTupleStorageSize(ValueType::tBIGINT));
+    allowNull.push_back(false);
+    inBytes.push_back(false);
 }
 
 StatsSource::StatsSource()  : m_statsTable(NULL) {
@@ -114,7 +132,7 @@ TableTuple* StatsSource::getStatsTuple(int64_t siteId, int32_t partitionId, bool
     m_interval = interval;
     if (m_statsTable == NULL) {
         VOLT_DEBUG("Table stats for site %" PRId64 ", partition %d is missing", siteId, partitionId);
-        assert (m_statsTable != NULL);
+        vassert(m_statsTable != NULL);
         return NULL;
     }
     m_statsTuple.setNValue(0, ValueFactory::getBigIntValue(now));

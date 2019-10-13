@@ -42,6 +42,7 @@ import org.apache.zookeeper_voltpatches.ZooKeeper;
 import org.json_voltpatches.JSONObject;
 import org.json_voltpatches.JSONStringer;
 import org.voltcore.logging.VoltLogger;
+import org.voltcore.messaging.HostMessenger;
 import org.voltcore.utils.Pair;
 import org.voltdb.catalog.Catalog;
 import org.voltdb.catalog.CatalogException;
@@ -49,7 +50,9 @@ import org.voltdb.common.Constants;
 import org.voltdb.common.NodeState;
 import org.voltdb.compiler.deploymentfile.DeploymentType;
 import org.voltdb.compiler.deploymentfile.DrRoleType;
-import org.voltdb.export.ExportManager;
+import org.voltdb.compiler.deploymentfile.FeaturesType;
+import org.voltdb.export.ExportManagerInterface;
+import org.voltdb.export.ExporterVersion;
 import org.voltdb.importer.ImportManager;
 import org.voltdb.iv2.MpInitiator;
 import org.voltdb.iv2.UniqueIdGenerator;
@@ -57,13 +60,13 @@ import org.voltdb.largequery.LargeBlockManager;
 import org.voltdb.modular.ModuleManager;
 import org.voltdb.settings.DbSettings;
 import org.voltdb.settings.NodeSettings;
-import org.voltdb.snmp.SnmpTrapSender;
 import org.voltdb.utils.CatalogUtil;
 import org.voltdb.utils.CatalogUtil.CatalogAndDeployment;
 import org.voltdb.utils.HTTPAdminListener;
 import org.voltdb.utils.InMemoryJarfile;
 import org.voltdb.utils.MiscUtils;
 import org.voltdb.utils.PlatformProperties;
+import org.voltdb.utils.ProClass;
 
 /**
  * This breaks up VoltDB initialization tasks into discrete units.
@@ -459,7 +462,8 @@ public class Inits {
 
                 if (!MiscUtils.validateLicense(m_rvdb.getLicenseApi(),
                                                m_rvdb.m_clusterSettings.get().hostcount(),
-                                               DrRoleType.fromValue(m_rvdb.getCatalogContext().getCluster().getDrrole())))
+                        DrRoleType.fromValue(m_rvdb.getCatalogContext().getCluster().getDrrole()),
+                        m_rvdb.getConfig().m_startAction))
                 {
                     // validateLicense logs. Exit call is here for testability.
                     VoltDB.crashGlobalVoltDB("VoltDB license constraints are not met.", false, null);
@@ -480,24 +484,10 @@ public class Inits {
 
             if (logConfig.getEnabled()) {
                 if (m_config.m_isEnterprise) {
-                    try {
-                        Class<?> loggerClass = MiscUtils.loadProClass("org.voltdb.CommandLogImpl",
-                                                                   "Command logging", false);
-                        if (loggerClass != null) {
-                            final Constructor<?> constructor = loggerClass.getConstructor(boolean.class,
-                                                                                          int.class,
-                                                                                          int.class,
-                                                                                          String.class,
-                                                                                          String.class);
-                            m_rvdb.m_commandLog = (CommandLog) constructor.newInstance(logConfig.getSynchronous(),
-                                                                                       logConfig.getFsyncinterval(),
-                                                                                       logConfig.getMaxtxns(),
-                                                                                       VoltDB.instance().getCommandLogPath(),
-                                                                                       VoltDB.instance().getCommandLogSnapshotPath());
-                        }
-                    } catch (Exception e) {
-                        VoltDB.crashLocalVoltDB("Unable to instantiate command log", true, e);
-                    }
+                    m_rvdb.m_commandLog = ProClass.newInstanceOf("org.voltdb.CommandLogImpl", "Command logging",
+                            ProClass.HANDLER_LOG, logConfig.getSynchronous(), logConfig.getFsyncinterval(),
+                            logConfig.getMaxtxns(), VoltDB.instance().getCommandLogPath(),
+                            VoltDB.instance().getCommandLogSnapshotPath());
                 }
             }
         }
@@ -510,19 +500,13 @@ public class Inits {
         @Override
         public void run() {
             if (m_config.m_isEnterprise && m_deployment.getSnmp() != null && m_deployment.getSnmp().isEnabled()) {
-                try {
-                    Class<?> loggerClass = MiscUtils.loadProClass("org.voltdb.snmp.SnmpTrapSenderImpl",
-                                                               "SNMP Adapter", false);
-                    if (loggerClass != null) {
-                        final Constructor<?> constructor = loggerClass.getConstructor();
-                        m_rvdb.m_snmp = (SnmpTrapSender) constructor.newInstance();
+                m_rvdb.m_snmp = ProClass.newInstanceOf("org.voltdb.snmp.SnmpTrapSenderImpl", "SNMP Adapter",
+                        ProClass.HANDLER_LOG);
+                if (m_rvdb.m_snmp != null) {
                         m_rvdb.m_snmp.initialize(
                                 m_deployment.getSnmp(),
                                 m_rvdb.getHostMessenger(),
                                 m_rvdb.getCatalogContext().cluster.getDrclusterid());
-                    }
-                } catch (Exception e) {
-                    VoltDB.crashLocalVoltDB("Unable to instantiate SNMP", true, e);
                 }
             }
         }
@@ -686,7 +670,9 @@ public class Inits {
         public void run() {
             // Let the Export system read its configuration from the catalog.
             try {
-                ExportManager.initialize(
+                FeaturesType features = m_rvdb.m_catalogContext.getDeployment().getFeatures();
+                ExportManagerInterface.initialize(
+                        features,
                         m_rvdb.m_myHostId,
                         m_rvdb.m_catalogContext,
                         m_isRejoin,

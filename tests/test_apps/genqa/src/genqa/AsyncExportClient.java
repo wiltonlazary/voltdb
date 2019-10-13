@@ -46,6 +46,7 @@ import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.time.Instant;
 import java.util.Map;
+import java.util.Random;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.TreeMap;
@@ -58,6 +59,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.concurrent.atomic.AtomicReference;
 
+import org.voltcore.logging.VoltLogger;
 import org.voltdb.VoltDB;
 import org.voltdb.VoltTable;
 import org.voltdb.client.Client;
@@ -68,13 +70,15 @@ import org.voltdb.ClientResponseImpl;
 import org.voltdb.client.ClientStats;
 import org.voltdb.client.ClientStatsContext;
 import org.voltdb.client.ClientStatusListenerExt;
+import org.voltdb.client.NullCallback;
 import org.voltdb.client.ProcedureCallback;
 import org.voltdb.client.exampleutils.AppHelper;
 import org.voltdb.iv2.TxnEgo;
 
 public class AsyncExportClient
 {
-    // Transactions between catalog swaps.
+    static VoltLogger log = new VoltLogger("ExportClient");
+// Transactions between catalog swaps.
     public static long CATALOG_SWAP_INTERVAL = 500000;
     // Number of txn ids per client log file.
     public static long CLIENT_TXNID_FILE_SIZE = 250000;
@@ -97,7 +101,7 @@ public class AsyncExportClient
             File logPath = new File(m_txnLogPath);
             if (!logPath.exists()) {
                 if (!logPath.mkdir()) {
-                    System.err.println("Problem creating log directory " + logPath);
+                    log.warn("Problem creating log directory " + logPath);
                 }
             }
         }
@@ -107,7 +111,7 @@ public class AsyncExportClient
             if (dh == null) {
                 dh = new File(m_txnLogPath, Integer.toString(partId));
                 if (!dh.mkdir()) {
-                    System.err.println("Problem createing log directory " + dh);
+                    log.warn("Problem creating log directory " + dh);
                 }
                 m_baseDirs.put(partId, dh);
             }
@@ -175,8 +179,10 @@ public class AsyncExportClient
             if (clientResponse.getStatus() == ClientResponse.SUCCESS)
             {
                 TrackingResults.incrementAndGet(0);
+                TransactionCounts.incrementAndGet(INSERT);
                 long txid = clientResponse.getResults()[0].asScalarLong();
                 final String trace = String.format("%d:%d:%d\n", m_rowid, txid, now);
+                // log.info("Success " + trace);
                 try
                 {
                     m_writer.write(TxnEgo.getPartitionId(txid),trace);
@@ -190,15 +196,46 @@ public class AsyncExportClient
             {
                 TrackingResults.incrementAndGet(1);
                 final String trace = String.format("%d:-1:%d:%s\n", m_rowid, now,((ClientResponseImpl)clientResponse).toJSONString());
+                // log.info("Fail " + trace);
                 try
                 {
                     m_writer.write(-1,trace);
                 }
                 catch (IOException e)
                 {
-                    System.err.println("Exception: " + e);
+                    log.error("Exception: " + e);
                     e.printStackTrace();
                 }
+            }
+        }
+    }
+
+    static class TableExportCallback implements ProcedureCallback
+    {
+        private final TxnIdWriter m_writer;
+        private final long m_type;
+        public TableExportCallback(TxnIdWriter writer, long type)
+        {
+            super();
+            m_type = type;
+            m_writer = writer;
+        }
+        @Override
+        public void clientCallback(ClientResponse clientResponse) {
+            // Track the result of the request (Success, Failure)
+            long now = System.currentTimeMillis();
+            int transType = clientResponse.getAppStatus(); // get INSERT, DELETE, or UPDATE)
+            if (clientResponse.getStatus() == ClientResponse.SUCCESS)
+            {
+
+                TrackingResults.incrementAndGet(0);
+                TransactionCounts.incrementAndGet(transType);
+            }
+            else
+            {
+                TrackingResults.incrementAndGet(1);
+                final String trace = String.format("%d:%s\n", now,((ClientResponseImpl)clientResponse).toJSONString());
+                log.info("TableExport failed: " + trace);
             }
         }
     }
@@ -218,6 +255,9 @@ public class AsyncExportClient
         final String procedure;
         final boolean exportGroups;
         final int exportTimeout;
+        final boolean usemigrate;
+        final boolean usetableexport;
+        final boolean usemigrateonly;
 
         ConnectionConfig( AppHelper apph) {
             displayInterval = apph.longValue("displayinterval");
@@ -232,11 +272,23 @@ public class AsyncExportClient
             parsedServers   = servers.split(",");
             exportGroups    = apph.booleanValue("exportgroups");
             exportTimeout   = apph.intValue("timeout");
+            usemigrate      = apph.booleanValue("usemigrate");
+            usetableexport  = apph.booleanValue("usetableexport");
+            usemigrateonly  = apph.booleanValue("usemigrateonly");
+
         }
     }
 
     // Initialize some common constants and variables
     private static final AtomicLongArray TrackingResults = new AtomicLongArray(2);
+
+    // If testing Table/Export, count inserts, deletes, update fore & aft
+
+    private static int INSERT = 1;
+    private static int DELETE = 2;
+    private static int UPDATE_OLD = 3;
+    private static int UPDATE_NEW = 4;
+    private static final AtomicLongArray TransactionCounts = new AtomicLongArray(4);
 
     private static File[] catalogs = {new File("genqa.jar"), new File("genqa2.jar")};
     private static File deployment = new File("deployment.xml");
@@ -264,6 +316,7 @@ public class AsyncExportClient
     // Application entry point
     public static void main(String[] args)
     {
+        VoltLogger log = new VoltLogger("ExportClient.main");
         try
         {
 
@@ -282,9 +335,12 @@ public class AsyncExportClient
                 .add("ratelimit", "rate_limit", "Rate limit to start from (number of transactions per second).", 100000)
                 .add("autotune", "auto_tune", "Flag indicating whether the benchmark should self-tune the transaction rate for a target execution latency (true|false).", "true")
                 .add("latencytarget", "latency_target", "Execution latency to target to tune transaction rate (in milliseconds).", 10)
-                .add("catalogswap", "catlog_swap", "Swap catalogs from the client", "false")
+                .add("catalogswap", "catalog_swap", "Swap catalogs from the client", "false")
                 .add("exportgroups", "export_groups", "Multiple export connections", "false")
                 .add("timeout","export_timeout","max seconds to wait for export to complete",300)
+                .add("usemigrate","usemigrate","use DDL that includes TTL MIGRATE action","false")
+                .add("usetableexport","usetableexport","use DDL that includes CREATE TABLE with EXPORT ON ... action","false")
+                .add("usemigrateonly","usemigrateonly","use DDL that includes MIGRATE without TTL","false")
                 .setArguments(args)
             ;
 
@@ -337,28 +393,66 @@ public class AsyncExportClient
             // Run the benchmark loop for the requested duration
             final long endTime = benchmarkStartTS + (1000l * config.duration);
             int swap_count = 0;
+            Random r = new Random();
             boolean first_cat = false;
             while (endTime > System.currentTimeMillis())
             {
                 long currentRowId = rowId.incrementAndGet();
-                // Post the request, asynchronously
-                try {
-                    clientRef.get().callProcedure(
-                                                  new AsyncCallback(writer, currentRowId),
-                                                  config.procedure,
-                                                  currentRowId,
-                                                  0);
+
+                // Table with Export
+                if (config.usetableexport) {
+                    // call TableExport twice, once will insert, the second will randomly update or delete
+                    for (int i = 0; i < 2; i++) {
+                        try {
+                            clientRef.get().callProcedure(
+                                    new TableExportCallback(writer, r.nextInt(3)+1),
+                                    "TableExport",
+                                    currentRowId,
+                                    0);
+                        }
+                        catch (Exception e) {
+                            log.fatal("Exception: " + e);
+                            e.printStackTrace();
+                            System.exit(-1);
+                        }
+                    }
                 }
-                catch (Exception e) {
-                    System.err.println("FATAL Exception: " + e);
-                    e.printStackTrace();
-                    System.exit(-1);
+                else {
+                // Post the request, asynchronously
+                    try {
+                        clientRef.get().callProcedure(
+                                                      new AsyncCallback(writer, currentRowId),
+                                                      config.procedure,
+                                                      currentRowId,
+                                                      0);
+                    }
+                    catch (Exception e) {
+                        log.fatal("Exception: " + e);
+                        e.printStackTrace();
+                        System.exit(-1);
+                    }
+                }
+
+                // Migrate without TTL -- queue up a MIGRATE FROM randomly, roughly half the time
+                if (config.usemigrateonly && r.nextBoolean()) {
+                    try {
+                        int i = r.nextInt(10);
+                        log.info("Calling MigrateExport for rows older than " + i + " seconds before now.");
+                        clientRef.get().callProcedure(
+                                new NullCallback(),
+                                "MigrateExport", i);
+                    }
+                    catch (Exception e) {
+                        log.fatal("Exception: " + e);
+                        e.printStackTrace();
+                        System.exit(-1);
+                    }
                 }
 
                 swap_count++;
                 if (((swap_count % CATALOG_SWAP_INTERVAL) == 0) && catalogSwap)
                 {
-                    System.out.println("Changing catalogs...");
+                    log.info("Changing catalogs...");
                     clientRef.get().updateApplicationCatalog(catalogs[first_cat ? 0 : 1], deployment);
                     first_cat = !first_cat;
                 }
@@ -374,13 +468,17 @@ public class AsyncExportClient
             clientRef.get().drain();
 
             Thread.sleep(10000);
+            // Might need lots of waiting but we'll do that in the runapp driver.
             waitForStreamedAllocatedMemoryZero(clientRef.get(),config.exportTimeout);
-            System.out.println("Writing export count as: " + TrackingResults.get(0) + " final rowid:" + rowId);
+
+            log.info("Writing export count as: " + TrackingResults.get(0) + " final rowid:" + rowId);
             //Write to export table to get count to be expected on other side.
             if (config.exportGroups) {
+                log.info("Insert row in Done table with JiggleExportGroupDoneTable proc");
                 clientRef.get().callProcedure("JiggleExportGroupDoneTable", TrackingResults.get(0));
             }
             else {
+                log.info("Insert row in Done table with JiggleExportDoneTable proc");
                 clientRef.get().callProcedure("JiggleExportDoneTable", TrackingResults.get(0));
             }
             writer.close(true);
@@ -402,10 +500,46 @@ public class AsyncExportClient
             , TrackingResults.get(1)
             );
             if ( TrackingResults.get(0) + TrackingResults.get(1) != rowId.longValue() ) {
-                System.out.println("WARNING Tracking results total doesn't match find rowId sequence number " + (TrackingResults.get(0) + TrackingResults.get(1)) + "!=" + rowId );
+                log.info("WARNING Tracking results total doesn't match find rowId sequence number " + (TrackingResults.get(0) + TrackingResults.get(1)) + "!=" + rowId );
+            }
+
+            // 2. Print TABLE EXPORT stats if that's configured
+            if (config.usetableexport) {
+                System.out.printf(
+                        "-------------------------------------------------------------------------------------\n"
+                      + " Table/Export Results\n"
+                      + "-------------------------------------------------------------------------------------\n\n"
+                      + "A total of %d calls were received...\n"
+                      + " - %,9d INSERT\n"
+                      + " - %,9d DELETE\n"
+                      + " - %,9d UPDATE"
+                      + "\n\n"
+                      + "-------------------------------------------------------------------------------------\n"
+                      , TrackingResults.get(0)+TrackingResults.get(1)
+                      , TransactionCounts.get(INSERT)
+                      , TransactionCounts.get(DELETE)
+                      , TransactionCounts.get(UPDATE_OLD)
+                      // old & new on each update so either = total updates, not the sum of the 2
+                      // +TransactionCounts.get(UPDATE_NEW)
+                      );
+                long export_table_count = get_table_count("EXPORT_PARTITIONED_TABLE_LOOPBACK");
+                System.out.println("EXPORT_PARTITIONED_TABLE_LOOPBACK count: " + export_table_count);
+                long table_with_metadata_count = get_table_count("PARTITIONED_TABLE_WITH_METADATA");
+                System.out.println("PARTITIONED_TABLE_WITH_METADATA count:" + table_with_metadata_count);
+
+                // do some sanity checks on the counts...
+                long meta_data_expected = TransactionCounts.get(INSERT) + TransactionCounts.get(DELETE) + TransactionCounts.get(UPDATE_OLD) * 2;
+                if (table_with_metadata_count != meta_data_expected) {
+                    System.err.println("Metadata counts don't match with table count: " + table_with_metadata_count);
+                }
+                long export_table_expected = TransactionCounts.get(INSERT) - TransactionCounts.get(DELETE);
+                if (export_table_count != export_table_expected) {
+                    System.err.println("Insert and delete counts don't match export table count: " + export_table_count);
+                }
+
             }
             // 3. Performance statistics (we only care about the procedure that we're benchmarking)
-            System.out.println(
+            log.info(
               "\n\n-------------------------------------------------------------------------------------\n"
             + " System Statistics\n"
             + "-------------------------------------------------------------------------------------\n\n");
@@ -424,72 +558,55 @@ public class AsyncExportClient
         }
         catch(Exception x)
         {
-            System.err.println("FATAL Exception: " + x);
+            log.fatal("Exception: " + x);
             x.printStackTrace();
         }
         // if we didn't get any successes we need to fail
         if ( TrackingResults.get(0) == 0 ) {
-            System.err.println("ERROR No successful transactions");
+            log.error("No successful transactions");
             System.exit(-1);
         }
     }
 
+    private static long get_table_count(String sqlTable) {
+        long count = 0;
+        try {
+            count = clientRef.get().callProcedure("@AdHoc", "SELECT COUNT(*) FROM " + sqlTable + ";").getResults()[0].asScalarLong();
+        }
+        catch (Exception e) {
+            System.err.println("Exception in get_table_count: " + e);
+            System.err.println("SELECT COUNT from table " + sqlTable + " failed");
+        }
+        return count;
+    }
+
     /**
-     * Connect to a set of servers in parallel. Each will retry until
-     * connection. This call will block until all have connected.
-     *
      * @param servers A comma separated list of servers using the hostname:port
      * syntax (where :port is optional).
      * @throws InterruptedException if anything bad happens with the threads.
      */
     static void connect() throws InterruptedException {
-        System.out.println("Connecting to VoltDB...");
+        log.info("Connecting to VoltDB...");
 
         String[] serverArray = config.parsedServers;
-        final CountDownLatch connections = new CountDownLatch(serverArray.length);
-
-        // use a new thread to connect to each server
-        for (final String server : serverArray) {
-            new Thread(new Runnable() {
-                @Override
-                public void run() {
-                    connectToOneServerWithRetry(server, config.port);
-                    connections.countDown();
-                }
-            }).start();
-        }
-        // block until all have connected
-        connections.await();
-    }
-
-    /**
-     * Connect to a single server with retry. Limited exponential backoff.
-     * No timeout. This will run until the process is killed if it's not
-     * able to connect.
-     *
-     * @param client The client to use for this server
-     * @param server hostname:port or just hostname (hostname can be ip).
-     */
-    static void connectToOneServerWithRetry(String server, int port) {
         Client client = clientRef.get();
-        int sleep = 1000;
-        while (true) {
+        for (final String server : serverArray) {
+        // connect to the first server in list; with TopologyChangeAware set, no need for more
             try {
-                client.createConnection(server, port);
+                client.createConnection(server, config.port);
                 break;
-            }
-            catch (Exception e) {
-                System.err.printf("Connection to " + server + " failed - retrying in %d second(s).\n", sleep / 1000);
-                try { Thread.sleep(sleep); } catch (Exception interruted) {}
-                if (sleep < 8000) sleep += sleep;
+            }catch (Exception e) {
+                log.error("Connection to " + server + " failed.\n");
             }
         }
-        System.out.printf("Connected to VoltDB node at: %s.\n", server);
     }
 
     static Client createClient() {
         ClientConfig clientConfig = new ClientConfig("", "");
-        clientConfig.setReconnectOnConnectionLoss(true);
+        // clientConfig.setReconnectOnConnectionLoss(true); **obsolete**
+        clientConfig.setClientAffinity(true);
+        clientConfig.setTopologyChangeAware(true);
+
         if (config.autoTune) {
             clientConfig.enableAutoTune();
             clientConfig.setAutoTuneTargetInternalLatency(config.latencyTarget);
@@ -497,7 +614,6 @@ public class AsyncExportClient
         else {
             clientConfig.setMaxTransactionsPerSecond(config.rateLimit);
         }
-        clientConfig.setTopologyChangeAware(true);
         Client client = ClientFactory.createClient(clientConfig);
         clientRef.set(client);
 
@@ -510,6 +626,8 @@ public class AsyncExportClient
     /**
      * Prints a one line update on performance that can be printed
      * periodically during a benchmark.
+     **
+     * @return
      */
     static private synchronized void printStatistics(ClientStatsContext context, boolean resetBaseline) {
         if (resetBaseline) {
@@ -523,15 +641,15 @@ public class AsyncExportClient
                 .get(config.procedure);
 
         if (stats == null) return;
+        // switch from app's runtime to VoltLogger clock time so results line up
+        // with apprunner if running in that framework
 
-        long time = Math.round((stats.getEndTimestamp() - benchmarkStartTS) / 1000.0);
-
-        System.out.printf("%02d:%02d:%02d ", time / 3600, (time / 60) % 60, time % 60);
-        System.out.printf("Throughput %d/s, ", stats.getTxnThroughput());
-        System.out.printf("Aborts/Failures %d/%d, ",
+        String stats_out = String.format(" Throughput %d/s, ", stats.getTxnThroughput());
+        stats_out += String.format("Aborts/Failures %d/%d, ",
                 stats.getInvocationAborts(), stats.getInvocationErrors());
-        System.out.printf("Avg/95%% Latency %.2f/%.2fms\n", stats.getAverageLatency(),
+        stats_out += String.format("Avg/95%% Latency %.2f/%.2fms\n", stats.getAverageLatency(),
                 stats.kPercentileLatencyAsDouble(0.95));
+        log.info(stats_out);
     }
 
     /**
@@ -548,10 +666,14 @@ public class AsyncExportClient
         boolean passed = false;
         Instant maxTime = Instant.now().plusSeconds(timeout);
         Instant maxStatsTime = Instant.now().plusSeconds(60);
+        long lastPending = 0;
         VoltTable stats = null;
+
+        // this is a problem -- Quiesce forces queuing but does NOT mean export is done
         try {
-            System.out.println(client.callProcedure("@Quiesce").getResults()[0]);
-        } catch (Exception ex) {
+            log.info(client.callProcedure("@Quiesce").getResults()[0]);
+        }
+        catch (Exception ex) {
         }
         while (true) {
 
@@ -561,10 +683,11 @@ public class AsyncExportClient
             try {
                 stats = client.callProcedure("@Statistics", "export", 0).getResults()[0];
                 maxStatsTime = Instant.now().plusSeconds(60);
-            } catch (Exception ex) {
-                // Export Statistics are updated asynchronously and may not be upto date immediately on all hosts
-                //retry a few times if we don't get an answer
-                System.err.println("Problem getting @Statistics export: "+ex.getMessage());
+            }
+            catch (Exception ex) {
+                // Export Statistics are updated asynchronously and may not be up to date immediately on all hosts
+                // retry a few times if we don't get an answer
+                log.error("Problem getting @Statistics export: "+ex.getMessage());
             }
             if (stats == null) {
                 Thread.sleep(5000);
@@ -577,11 +700,25 @@ public class AsyncExportClient
                     + "increase --timeout arg for slower clients" );
                 }
                 Long pending = stats.getLong("TUPLE_PENDING");
-                if (0 != pending ) {
-                    String stream = stats.getString("SOURCE");
-                    Long partition = stats.getLong("PARTITION_ID");
+                String stream = stats.getString("SOURCE");
+                String target = stats.getString("TARGET");
+                String active = stats.getString("ACTIVE");
+                Long partition = stats.getLong("PARTITION_ID");
+
+                // don't wait for inactive partitions.
+                // there are cases where ACTIVE==FALSE is a bug that won't get caught here anyway
+                if (active.equalsIgnoreCase("FALSE"))
+                    continue;
+                if ( pending != lastPending) {
+                    // reset the timer if we are making progress
+                    maxTime = Instant.now().plusSeconds(timeout);
+                    lastPending = pending;
+                }
+                // switch this message to debug out?
+                log.info("DEBUG: Partition "+partition+" for stream "+stream+", target "+target+" TUPLE_PENDING is "+pending);
+                if (pending != 0) {
                     passedThisTime = false;
-                    System.out.println("Partition "+partition+" for stream "+stream+" TUPLE_PENDING is  not zero, got "+pending);
+                    log.info("Partition "+partition+" for stream "+stream+" TUPLE_PENDING is not zero, got "+pending);
                     break;
                 }
             }
@@ -591,8 +728,8 @@ public class AsyncExportClient
             }
             Thread.sleep(5000);
         }
-        System.out.println("Passed is: " + passed);
-        System.out.println(stats);
+        log.info("Passed is: " + passed);
+        log.info(stats);
     }
 
 }

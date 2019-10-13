@@ -31,9 +31,11 @@ import static org.junit.Assert.assertTrue;
 import java.io.IOException;
 import java.io.StringWriter;
 import java.math.BigDecimal;
+import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.TimeZone;
 
@@ -52,8 +54,6 @@ import org.voltdb.types.TimestampType;
 import org.voltdb.types.VoltDecimalHelper;
 
 import au.com.bytecode.opencsv_voltpatches.CSVWriter;
-import java.nio.ByteBuffer;
-import java.util.Arrays;
 
 public class TestExportDecoderBase
 {
@@ -157,7 +157,7 @@ public class TestExportDecoderBase
         }
         //clear the table
         vtable.clearRowData();
-        AdvertisedDataSource source = new AdvertisedDataSource(partition, "foo", "yankeelover",
+        AdvertisedDataSource source = new AdvertisedDataSource(partition, "yankeelover",
                 partitionColumn, 0, 32, col_names, col_types, Arrays.asList(COLUMN_LENGTHS),
                 AdvertisedDataSource.ExportFormat.SEVENDOTX);
         return source;
@@ -191,6 +191,8 @@ public class TestExportDecoderBase
     @Flaky(description="TestExportDecoderBase.testExportWriter")
     public void testExportWriter() throws IOException {
         long l = System.currentTimeMillis();
+        //clear the table
+        vtable.clearRowData();
         vtable.addRow(l, l, l, 0, l, l, (byte) 1, (short) 2, 3, 4, 5.5, 6, "xx", new BigDecimal(88), GEOG_POINT, GEOG);
         vtable.advanceRow();
         byte[] rowBytes = ExportEncoder.encodeRow(vtable, "mytable", 7, 1L);

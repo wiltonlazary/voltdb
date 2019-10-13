@@ -32,6 +32,7 @@ import org.voltdb.VoltDB.Configuration;
 import org.voltdb.client.Client;
 import org.voltdb.client.ClientResponse;
 import org.voltdb.compiler.VoltProjectBuilder;
+import org.voltdb.compiler.deploymentfile.ServerExportEnum;
 import org.voltdb.export.ExportDataProcessor;
 import org.voltdb.export.ExportTestClient;
 import org.voltdb.export.ExportTestVerifier;
@@ -84,12 +85,13 @@ public class TestSnapshotWithViews extends TestExportBase {
         for (String ddl : ddls) {
             client.callProcedure("@AdHoc", ddl);
         }
+        m_streamNames.add("EX");
         int numValues=5000;
         for (int i=0;i<numValues;i++) {
             client.callProcedure("@AdHoc", "insert into ex values(" + i + ");");
         }
         client.drain();
-        waitForStreamedAllocatedMemoryZero(client);
+        waitForExportAllRowsDelivered(client, m_streamNames);
         ClientResponse response = client.callProcedure("@AdHoc", "select count(*) from v_ex");
         assertEquals(response.getResults()[0].asScalarLong(), numValues);
 
@@ -122,6 +124,7 @@ public class TestSnapshotWithViews extends TestExportBase {
         for (String ddl : ddls) {
             client.callProcedure("@AdHoc", ddl);
         }
+        m_streamNames.add("EX");
         StringBuilder insertSql;
         for (int i=0;i<5000;i++) {
             insertSql = new StringBuilder();
@@ -129,7 +132,7 @@ public class TestSnapshotWithViews extends TestExportBase {
             client.callProcedure("@AdHoc", insertSql.toString());
         }
         client.drain();
-        waitForStreamedAllocatedMemoryZero(client);
+        waitForExportAllRowsDelivered(client, m_streamNames);
         client.callProcedure("@AdHoc", "delete from v_ex where i = 0");
         ClientResponse response = client.callProcedure("@AdHoc", "select count(*) from v_ex");
         assertEquals(response.getResults()[0].asScalarLong(), 4999);
@@ -163,9 +166,10 @@ public class TestSnapshotWithViews extends TestExportBase {
         for (String ddl : ddls) {
             client.callProcedure("@AdHoc", ddl);
         }
+        m_streamNames.add("EX");
         client.callProcedure("@AdHoc", "insert into ex values(0)");
         client.drain();
-        waitForStreamedAllocatedMemoryZero(client);
+        waitForExportAllRowsDelivered(client, m_streamNames);
         client.callProcedure("@AdHoc", "update v_ex set counti = 10");
         ClientResponse response = client.callProcedure("@AdHoc", "select counti from v_ex");
         assertEquals(response.getResults()[0].asScalarLong(), 10);
@@ -273,7 +277,6 @@ public class TestSnapshotWithViews extends TestExportBase {
             client.callProcedure("@AdHoc", insertSql.toString());
         }
         client.drain();
-        waitForStreamedAllocatedMemoryZero(client);
         ClientResponse response = client.callProcedure("@AdHoc", "select count(*) from v_ex");
         assertEquals(response.getResults()[0].asScalarLong(), 5000);
         response = client.callProcedure("@AdHoc", "select count(*) from v_ex_np");
@@ -296,6 +299,8 @@ public class TestSnapshotWithViews extends TestExportBase {
         assertEquals(response.getResults()[0].asScalarLong(), 5000);
         response = client.callProcedure("@AdHoc", "select count(*) from v_ex_np");
         assertEquals(response.getResults()[0].asScalarLong(), 5000);
+        System.out.println("Snapshot Restore for the second time...........");
+        client.callProcedure("@SnapshotRestore", "/tmp/" + System.getProperty("user.name"), "testnonce");
     }
 
     public TestSnapshotWithViews(final String name) {
@@ -317,7 +322,7 @@ public class TestSnapshotWithViews extends TestExportBase {
         VoltProjectBuilder project = new VoltProjectBuilder();
         project.setUseDDLSchema(true);
         Properties props = new Properties();
-        project.addExport(true /* enabled */, "custom", props);
+        project.addExport(true, ServerExportEnum.CUSTOM, props);
 
         /*
          * compile the catalog all tests start with

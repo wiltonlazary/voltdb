@@ -43,7 +43,7 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include <cassert>
+#include <common/debuglog.h>
 #include <iostream>
 #include "indexes/tableindexfactory.h"
 #include "common/TupleSchemaBuilder.h"
@@ -213,7 +213,7 @@ private:
 
 static CoveringCellIndex* getCoveringCellIndexInstance(const TableIndexScheme &scheme) {
     TupleSchemaBuilder builder(1);
-    builder.setColumnAtIndex(0, VALUE_TYPE_POINT);
+    builder.setColumnAtIndex(0, ValueType::tPOINT);
     return new CoveringCellIndex(builder.buildKeySchema(), scheme);
 }
 
@@ -224,7 +224,7 @@ TableIndex *TableIndexFactory::getInstance(const TableIndexScheme &scheme) {
     }
 
     const TupleSchema *tupleSchema = scheme.tupleSchema;
-    assert(tupleSchema);
+    vassert(tupleSchema);
     bool isIntsOnly = true;
     bool isInlinesOrColumnsOnly = true;
     std::vector<ValueType> keyColumnTypes;
@@ -248,7 +248,7 @@ TableIndex *TableIndexFactory::getInstance(const TableIndexScheme &scheme) {
             }
             bool inBytes = false;
             uint32_t declaredLength;
-            if (exprType == VALUE_TYPE_VARCHAR || exprType == VALUE_TYPE_VARBINARY) {
+            if (exprType == ValueType::tVARCHAR || exprType == ValueType::tVARBINARY) {
                 // Setting the column length to TUPLE_SCHEMA_COLUMN_MAX_VALUE_LENGTH constrains the
                 // maximum length of expression values that can be indexed with the same limit
                 // that gets applied to column values.
@@ -263,7 +263,7 @@ TableIndex *TableIndexFactory::getInstance(const TableIndexScheme &scheme) {
                 // to reliably determine that the result value is always small enough to "inline".
                 declaredLength = TupleSchema::COLUMN_MAX_VALUE_LENGTH;
                 isInlinesOrColumnsOnly = false;
-                if (exprType == VALUE_TYPE_VARCHAR) {
+                if (exprType == ValueType::tVARCHAR) {
                     inBytes = true;
                 }
             } else {
@@ -289,7 +289,7 @@ TableIndex *TableIndexFactory::getInstance(const TableIndexScheme &scheme) {
     }
 
     TupleSchema *keySchema = TupleSchema::createKeySchema(keyColumnTypes, keyColumnLengths, keyColumnInBytes);
-    assert(keySchema);
+    vassert(keySchema);
     VOLT_TRACE("Creating index for '%s' with key schema '%s'", scheme.name.c_str(), keySchema->debug().c_str());
     TableIndexPicker picker(keySchema, isIntsOnly, isInlinesOrColumnsOnly, scheme);
     TableIndex *retval = picker.getInstance();

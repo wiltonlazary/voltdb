@@ -59,6 +59,7 @@ import org.voltcore.logging.VoltLogger;
 import org.voltcore.messaging.BinaryPayloadMessage;
 import org.voltcore.messaging.HostMessenger;
 import org.voltcore.messaging.Mailbox;
+import org.voltcore.messaging.SiteFailureForwardMessage;
 import org.voltcore.messaging.VoltMessage;
 import org.voltcore.network.CipherExecutor;
 import org.voltcore.network.Connection;
@@ -150,7 +151,7 @@ public class ClientInterface implements SnapshotDaemon.DaemonInitiator {
     // connection IDs used by internal adapters
     public static final long RESTORE_AGENT_CID          = Long.MIN_VALUE + 1;
     public static final long SNAPSHOT_UTIL_CID          = Long.MIN_VALUE + 2;
-    public static final long ELASTIC_JOIN_CID           = Long.MIN_VALUE + 3;
+    public static final long ELASTIC_COORDINATOR_CID    = Long.MIN_VALUE + 3;
     // public static final long UNUSED_CID (was DR)     = Long.MIN_VALUE + 4;
     // public static final long UNUSED_CID              = Long.MIN_VALUE + 5;
     public static final long EXECUTE_TASK_CID           = Long.MIN_VALUE + 6;
@@ -158,6 +159,8 @@ public class ClientInterface implements SnapshotDaemon.DaemonInitiator {
     public static final long RESTORE_SCHEMAS_CID        = Long.MIN_VALUE + 8;
     public static final long SHUTDONW_SAVE_CID          = Long.MIN_VALUE + 9;
     public static final long NT_REMOTE_PROC_CID         = Long.MIN_VALUE + 10;
+    public static final long MIGRATE_ROWS_DELETE_CID    = Long.MIN_VALUE + 11;
+    public static final long TASK_MANAGER_CID           = Long.MIN_VALUE + 12;
 
     // Leave CL_REPLAY_BASE_CID at the end, it uses this as a base and generates more cids
     // PerPartition cids
@@ -208,12 +211,12 @@ public class ClientInterface implements SnapshotDaemon.DaemonInitiator {
     ZooKeeper m_zk;
 
     /**
-     * The CIHM is unique to the connection and the ACG is shared by all connections
-     * serviced by the associated network thread. They are paired so as to only do a single
-     * lookup.
+     * The CIHM is unique to the connection and the ACG is shared by all connections serviced by the associated network
+     * thread. They are paired so as to only do a single lookup.
+     * <p>
+     * Note: An initialSize of 1024 actually creates an array of 2048 in the map
      */
-    private final ConcurrentHashMap<Long, ClientInterfaceHandleManager> m_cihm =
-            new ConcurrentHashMap<Long, ClientInterfaceHandleManager>(2048, .75f, 128);
+    private final ConcurrentHashMap<Long, ClientInterfaceHandleManager> m_cihm = new ConcurrentHashMap<>(1024);
 
     private final RateLimitedClientNotifier m_notifier = new RateLimitedClientNotifier();
 
@@ -314,7 +317,7 @@ public class ClientInterface implements SnapshotDaemon.DaemonInitiator {
                 catch (IOException e) {
                     String msg = "Client interface failed to bind to"
                             + (m_isAdmin ? " Admin " : " ") + "port: " + m_port;
-                    CoreUtils.printPortsInUse(hostLog);
+                    MiscUtils.printPortsInUse(hostLog);
                     VoltDB.crashLocalVoltDB(msg, false, e);
                 }
             }
@@ -1049,10 +1052,18 @@ public class ClientInterface implements SnapshotDaemon.DaemonInitiator {
             }
 
             try {
-                ProcedurePartitionInfo ppi = (ProcedurePartitionInfo)catProc.getAttachment();
-                Object invocationParameter = response.getInvocation().getParameterAtIndex(ppi.index);
-                int partition = TheHashinator.getPartitionForParameter(
-                        ppi.type, invocationParameter);
+                int partition = -1;
+                if (catProc.getSinglepartition() && catProc.getPartitionparameter() == -1) {
+                    // Directed procedure running on partition
+                    partition = response.getInvocation().getPartitionDestination();
+                    assert partition != -1;
+                } else {
+                     // Regular partitioned procedure
+                    ProcedurePartitionInfo ppi = (ProcedurePartitionInfo)catProc.getAttachment();
+                    Object invocationParameter = response.getInvocation().getParameterAtIndex(ppi.index);
+                    partition = TheHashinator.getPartitionForParameter(
+                          ppi.type, invocationParameter);
+                }
                 m_dispatcher.createTransaction(cihm.connection.connectionId(),
                         response.getInvocation(),
                         catProc.getReadonly(),
@@ -1064,7 +1075,8 @@ public class ClientInterface implements SnapshotDaemon.DaemonInitiator {
                 return true;
             } catch (Exception e) {
                 // unable to hash to a site, return an error
-                assert(clientResponse == null);
+                assert(clientResponse == null || clientResponse.getStatus() == ClientResponse.TXN_MISROUTED);
+                hostLog.warn("Unexpected error trying to restart misrouted txn", e);
                 clientResponse = getMispartitionedErrorResponse(response.getInvocation(), catProc, e);
                 return false;
             }
@@ -1076,7 +1088,7 @@ public class ClientInterface implements SnapshotDaemon.DaemonInitiator {
     }
 
     // Wrap API to SimpleDtxnInitiator - mostly for the future
-    public boolean createTransaction(
+    public CreateTransactionResult createTransaction(
             final long connectionId,
             final StoredProcedureInvocation invocation,
             final boolean isReadOnly,
@@ -1101,7 +1113,7 @@ public class ClientInterface implements SnapshotDaemon.DaemonInitiator {
     }
 
     // Wrap API to SimpleDtxnInitiator - mostly for the future
-    public boolean createTransaction(
+    public CreateTransactionResult createTransaction(
             final long connectionId,
             final long txnId,
             final long uniqueId,
@@ -1188,7 +1200,6 @@ public class ClientInterface implements SnapshotDaemon.DaemonInitiator {
             @Override
             public void deliver(final VoltMessage message) {
                 if (message instanceof InitiateResponseMessage) {
-                    final CatalogContext catalogContext = m_catalogContext.get();
                     // forward response; copy is annoying. want slice of response.
                     InitiateResponseMessage response = (InitiateResponseMessage)message;
                     StoredProcedureInvocation invocation = response.getInvocation();
@@ -1204,7 +1215,7 @@ public class ClientInterface implements SnapshotDaemon.DaemonInitiator {
                     Procedure procedure = null;
 
                     if (invocation != null) {
-                        procedure = getProcedureFromName(invocation.getProcName(), catalogContext);
+                        procedure = getProcedureFromName(invocation.getProcName());
                         assert (procedure != null);
                     }
 
@@ -1248,8 +1259,10 @@ public class ClientInterface implements SnapshotDaemon.DaemonInitiator {
 
                     m_dispatcher.getInternelAdapterNT().callProcedure(m_catalogContext.get().authSystem.getInternalAdminUser(),
                             true, 1000 * 120, cb, invocation.getProcName(), itm.getParameters());
-                }
-                else {
+                } else if (message instanceof SiteFailureForwardMessage) {
+                    SiteFailureForwardMessage msg = (SiteFailureForwardMessage)message;
+                    m_messenger.notifyOfHostDown(CoreUtils.getHostIdFromHSId(msg.m_reportingHSId));
+                } else {
                     // m_d is for test only
                     m_d.offer(message);
                 }
@@ -1530,8 +1543,8 @@ public class ClientInterface implements SnapshotDaemon.DaemonInitiator {
         return errResp;
     }
 
-    public Procedure getProcedureFromName(String procName, CatalogContext catalogContext) {
-        return InvocationDispatcher.getProcedureFromName(procName, catalogContext);
+    public Procedure getProcedureFromName(String procName) {
+        return InvocationDispatcher.getProcedureFromName(procName, m_catalogContext.get());
     }
 
     private ScheduledFuture<?> m_deadConnectionFuture;
@@ -2016,9 +2029,13 @@ public class ClientInterface implements SnapshotDaemon.DaemonInitiator {
      * @param partitionId
      */
     public void sendEOLMessage(int partitionId) {
-        final long initiatorHSId = m_cartographer.getHSIdForMaster(partitionId);
-        Iv2EndOfLogMessage message = new Iv2EndOfLogMessage(partitionId);
-        m_mailbox.send(initiatorHSId, message);
+        final Long initiatorHSId = m_cartographer.getHSIdForMaster(partitionId);
+        if (initiatorHSId == null) {
+            log.warn("ClientInterface.sendEOLMessage: Master does not exist for partition: " + partitionId);
+        } else {
+            Iv2EndOfLogMessage message = new Iv2EndOfLogMessage(partitionId);
+            m_mailbox.send(initiatorHSId, message);
+        }
     }
 
     public List<Iterator<Map.Entry<Long, Map<String, InvocationInfo>>>> getIV2InitiatorStats() {
@@ -2164,7 +2181,16 @@ public class ClientInterface implements SnapshotDaemon.DaemonInitiator {
                     final int interval = Integer.parseInt(System.getProperty("MIGRATE_PARTITION_LEADER_INTERVAL", "1"));
                     final int delay = Integer.parseInt(System.getProperty("MIGRATE_PARTITION_LEADER_DELAY", "1"));
                     m_migratePartitionLeaderExecutor.scheduleAtFixedRate(
-                            () -> {startMigratePartitionLeader(message.isForStopNode());},
+                            () -> {
+                                try {
+                                    startMigratePartitionLeader(message.isForStopNode());
+                                } catch (Exception e) {
+                                    tmLog.error("Migrate partition leader encountered unexpected error", e);
+                                } catch (Throwable t) {
+                                    VoltDB.crashLocalVoltDB("Migrate partition leader encountered unexpected error",
+                                            true, t);
+                                }
+                            },
                             delay, interval, TimeUnit.SECONDS);
                 }
                 hostLog.info("MigratePartitionLeader task is started.");
@@ -2256,11 +2282,18 @@ public class ClientInterface implements SnapshotDaemon.DaemonInitiator {
             tmLog.debug("[@MigratePartitionLeader]\n" + vt.toFormattedString());
         }
 
+        boolean transactionStarted = false;
+        Long targetHSId = m_cartographer.getHSIDForPartitionHost(targetHostId, partitionId);
+        if (targetHSId == null) {
+            if (tmLog.isDebugEnabled()) {
+                tmLog.debug(String.format("Partition %d is no longer on host %d", partitionId, targetHostId));
+            }
+            return;
+        }
         try {
             SimpleClientResponseAdapter.SyncCallback cb = new SimpleClientResponseAdapter.SyncCallback();
             final String procedureName = "@MigratePartitionLeader";
             Config procedureConfig = SystemProcedureCatalog.listing.get(procedureName);
-            Procedure proc = procedureConfig.asCatalogProcedure();
             StoredProcedureInvocation spi = new StoredProcedureInvocation();
             spi.setProcName(procedureName);
             spi.setClientHandle(m_executeTaskAdpater.registerCallback(cb));
@@ -2269,7 +2302,6 @@ public class ClientInterface implements SnapshotDaemon.DaemonInitiator {
                 spi = MiscUtils.roundTripForCL(spi);
             }
 
-            long targetHSId = m_cartographer.getHSIDForPartitionHost(targetHostId, partitionId);
             //Info saved for the node failure handling
             MigratePartitionLeaderInfo spiInfo = new MigratePartitionLeaderInfo(
                     m_cartographer.getHSIDForPartitionHost(hostId, partitionId),
@@ -2284,33 +2316,42 @@ public class ClientInterface implements SnapshotDaemon.DaemonInitiator {
                 throw new IOException("failure simulation");
             }
             synchronized (m_executeTaskAdpater) {
-                createTransaction(m_executeTaskAdpater.connectionId(),
+                if (createTransaction(m_executeTaskAdpater.connectionId(),
                         spi,
-                        proc.getReadonly(),
-                        proc.getSinglepartition(),
-                        proc.getEverysite(),
+                        procedureConfig.getReadonly(),
+                        procedureConfig.getSinglepartition(),
+                        procedureConfig.getEverysite(),
                         partitionId,
                         spi.getSerializedSize(),
-                        System.nanoTime());
+                        System.nanoTime()) != CreateTransactionResult.SUCCESS) {
+                    tmLog.warn(String.format("Failed to start transaction for migration of partition %d to host %d",
+                            partitionId, targetHostId));
+                    notifyPartitionMigrationStatus(partitionId, targetHSId, true);
+                    return;
+                }
             }
 
+            transactionStarted = true;
+
             final long timeoutMS = 5 * 60 * 1000;
-            ClientResponse resp= cb.getResponse(timeoutMS);
-            if (resp.getStatus() == ClientResponse.SUCCESS) {
+            ClientResponse resp = cb.getResponse(timeoutMS);
+            if (resp != null && resp.getStatus() == ClientResponse.SUCCESS) {
                 tmLog.info(String.format("The partition leader for %d has been moved to host %d.",
                         partitionId, targetHostId));
             } else {
                 //not necessary a failure.
                 tmLog.warn(String.format("Fail to move the leader of partition %d to host %d. %s",
-                        partitionId, targetHostId, resp.getStatusString()));
+                        partitionId, targetHostId, resp == null ? null : resp.getStatusString()));
                 notifyPartitionMigrationStatus(partitionId, targetHSId, true);
             }
-        } catch (IOException | InterruptedException e) {
-            tmLog.warn(String.format("errors in leader change for partition %d: %s", partitionId, e.getMessage()));
-            notifyPartitionMigrationStatus(partitionId,
-                    m_cartographer.getHSIDForPartitionHost(targetHostId, partitionId),
-                    true);
+        } catch (Exception e) {
+            tmLog.warn(String.format("errors in leader change for partition %d", partitionId), e);
+            notifyPartitionMigrationStatus(partitionId, targetHSId, true);
         } finally {
+            if (!transactionStarted) {
+                return;
+            }
+
             //wait for the Cartographer to see the new partition leader. The leader promotion process should happen instantly.
             //If the new leader does not show up in 5 min, the cluster may have experienced host-down events.
             long remainingWaitTime = TimeUnit.MINUTES.toMillis(5);
@@ -2323,7 +2364,13 @@ public class ClientInterface implements SnapshotDaemon.DaemonInitiator {
                 } catch (InterruptedException ignoreIt) {
                 }
                 remainingWaitTime -= waitingInterval;
-                if (CoreUtils.getHostIdFromHSId(m_cartographer.getHSIdForMaster(partitionId)) == targetHostId) {
+                Long hsId = m_cartographer.getHSIdForMaster(partitionId);
+                if (hsId == null) {
+                    log.warn("ClientInterface.startMigratePartitionLeader: Master does not exist for partition: "
+                            + partitionId);
+                    break;
+                }
+                if (CoreUtils.getHostIdFromHSId(hsId) == targetHostId) {
                     migrationComplete = true;
                     break;
                 }
@@ -2346,9 +2393,7 @@ public class ClientInterface implements SnapshotDaemon.DaemonInitiator {
             }
 
             if (!migrationComplete) {
-                notifyPartitionMigrationStatus(partitionId,
-                        m_cartographer.getHSIDForPartitionHost(targetHostId, partitionId),
-                        true);
+                notifyPartitionMigrationStatus(partitionId, targetHSId, true);
             }
         }
     }
@@ -2360,27 +2405,20 @@ public class ClientInterface implements SnapshotDaemon.DaemonInitiator {
 
     private void notifyPartitionMigrationStatus(int partitionId, long targetHSId, boolean failed) {
         for (final ClientInterfaceHandleManager cihm : m_cihm.values()) {
-            try {
-                cihm.connection.queueTask(new Runnable() {
-                    @Override
-                    public void run() {
-                        if (cihm.repairCallback != null) {
-                            if (failed) {
-                                cihm.repairCallback.leaderMigrationFailed(partitionId, targetHSId);
-                            } else {
-                                cihm.repairCallback.leaderMigrationStarted(partitionId, targetHSId);
-                            }
-                        }
-                    }
-                });
-            } catch (UnsupportedOperationException ignore) {
-                // In case some internal connections don't implement queueTask()
-                if (cihm.repairCallback != null) {
+            if (cihm.repairCallback != null) {
+                Runnable notify = () -> {
                     if (failed) {
                         cihm.repairCallback.leaderMigrationFailed(partitionId, targetHSId);
                     } else {
                         cihm.repairCallback.leaderMigrationStarted(partitionId, targetHSId);
                     }
+                };
+
+                try {
+                    cihm.connection.queueTask(notify);
+                } catch (UnsupportedOperationException ignore) {
+                    // In case some internal connections don't implement queueTask()
+                    notify.run();
                 }
             }
         }

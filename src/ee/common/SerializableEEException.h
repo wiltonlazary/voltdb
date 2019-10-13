@@ -15,19 +15,29 @@
  * along with VoltDB.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef SERIALIZABLEEEEXCEPTION_H_
-#define SERIALIZABLEEEEXCEPTION_H_
-
+#pragma once
 #include <string>
 #include <stdexcept>
 
-#define throwSerializableEEException(...) do { char msg[8192]; snprintf(msg, 8192, __VA_ARGS__); throw voltdb::SerializableEEException(VOLT_EE_EXCEPTION_TYPE_EEEXCEPTION, msg); } while (false)
+#define throwSerializableEEException(...) do {                  \
+   char msg[8192];                                              \
+   snprintf(msg, sizeof msg, __VA_ARGS__);                      \
+   msg[sizeof msg - 1] = '\0';                                  \
+   throw voltdb::SerializableEEException(msg);                  \
+} while (false)
+
+#define throwSerializableTypedEEException(type, ...) do {       \
+   char msg[8192];                                              \
+   snprintf(msg, sizeof msg, __VA_ARGS__);                      \
+   msg[sizeof msg - 1] = '\0';                                  \
+   throw voltdb::SerializableEEException(type, msg);            \
+} while (false)
 
 namespace voltdb {
 
 class ReferenceSerializeOutput;
 
-enum VoltEEExceptionType {
+enum class VoltEEExceptionType : int8_t {
     VOLT_EE_EXCEPTION_TYPE_NONE = 0,
     VOLT_EE_EXCEPTION_TYPE_EEEXCEPTION = 1,
     VOLT_EE_EXCEPTION_TYPE_SQL = 2,
@@ -54,34 +64,31 @@ enum VoltEEExceptionType {
  * this exception.
  */
 class SerializableEEException : public std::runtime_error {
+    const VoltEEExceptionType m_exceptionType;
+    std::string m_message;
+protected:
+    virtual void p_serialize(ReferenceSerializeOutput *output) const {};
 public:
     /*
      * Constructor that performs the serialization to the engines
      * exception buffer.
      */
-    SerializableEEException(VoltEEExceptionType exceptionType, std::string message);
-    SerializableEEException(std::string message);
-    virtual ~SerializableEEException() throw();
+    SerializableEEException(VoltEEExceptionType exceptionType, std::string const& message);
+    SerializableEEException(std::string const& message);
+    virtual ~SerializableEEException() {}
 
     void serialize (ReferenceSerializeOutput *output) const;
-    virtual const std::string message() const { return m_message; }
-    VoltEEExceptionType getType() const { return m_exceptionType; }
-    void appendContextToMessage(const std::string& more) { m_message += more; }
-protected:
-    virtual void p_serialize(ReferenceSerializeOutput *output) const {};
-
-private:
-    const VoltEEExceptionType m_exceptionType;
-    std::string m_message;
-
+    virtual std::string message() const {
+        return m_message;
+    }
+    VoltEEExceptionType getType() const {
+        return m_exceptionType;
+    }
+    void appendContextToMessage(const std::string& more) {
+        m_message += more;
+    }
 };
 
-class UnexpectedEEException : public SerializableEEException {
-public:
-    UnexpectedEEException(std::string message)
-      : SerializableEEException(message)
-    { }
-};
+using UnexpectedEEException = SerializableEEException;
 
 } // end namespace voltdb
-#endif /* SERIALIZABLEEEEXCEPTION_H_ */

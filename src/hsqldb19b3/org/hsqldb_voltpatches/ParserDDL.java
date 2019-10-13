@@ -32,6 +32,9 @@
 package org.hsqldb_voltpatches;
 
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 
 import org.hsqldb_voltpatches.HsqlNameManager.HsqlName;
 import org.hsqldb_voltpatches.index.Index;
@@ -39,7 +42,6 @@ import org.hsqldb_voltpatches.lib.HsqlArrayList;
 import org.hsqldb_voltpatches.lib.HsqlList;
 import org.hsqldb_voltpatches.lib.OrderedHashSet;
 import org.hsqldb_voltpatches.lib.OrderedIntHashSet;
-import org.hsqldb_voltpatches.lib.StringUtil;
 import org.hsqldb_voltpatches.rights.Grantee;
 import org.hsqldb_voltpatches.rights.GranteeManager;
 import org.hsqldb_voltpatches.rights.Right;
@@ -904,9 +906,13 @@ public class ParserDDL extends ParserRoutine {
                         checkIsSimpleName();
 
                         return compileAlterTableAddColumn(t);
+
                     case Tokens.USING :
                         if (t.getTTL() != null) {
                             throw Error.error(ErrorCode.X_42504);
+                        }
+                        if (t.hasMigrationTarget()) {
+                            throw Error.error(ErrorCode.X_42581, "May not add TTL column");
                         }
                         return readTimeToLive(t, true);
                     default :
@@ -972,6 +978,14 @@ public class ParserDDL extends ParserRoutine {
             case Tokens.ALTER : {
                 read();
 
+                if (token.tokenType == Tokens.EXPORT) {
+                    return readPersistentExport(t, true);
+                }
+
+                if (token.tokenType == Tokens.USING) {
+                    return readTimeToLive(t, true);
+                }
+
                 if (token.tokenType == Tokens.COLUMN) {
                     read();
                 }
@@ -983,9 +997,6 @@ public class ParserDDL extends ParserRoutine {
 
                 return compileAlterColumn(t, column, columnIndex);
             }
-            case Tokens.USING : {
-                return readTimeToLive(t, true);
-            }
             default : {
                 throw unexpectedToken();
             }
@@ -994,11 +1005,11 @@ public class ParserDDL extends ParserRoutine {
 
     //VoltDB extension, drop TTL
     private Statement compileAlterTableDropTTL(Table t) {
+        if (t.hasMigrationTarget()) {
+            throw Error.error(ErrorCode.X_42581, "May not drop TTL column");
+        }
         if (t.getTTL() == null) {
             throw Error.error(ErrorCode.X_42501);
-        }
-        if (!StringUtil.isEmpty(t.getTTL().migrationTarget)) {
-            throw unexpectedToken("May not drop migration target");
         }
         Object[] args = new Object[] {
             t.getName(),
@@ -1009,6 +1020,97 @@ public class ParserDDL extends ParserRoutine {
                                    null, t.getName());
     }
 
+    private void setPeristentExportTriggers(Table table) {
+        // EXPORT TO TARGET FOO ON INSERT, DELETE, UPDATE;
+        if (token.tokenType != Tokens.EXPORT) {
+            return;
+        }
+        String target = readMigrateTarget();
+        List<String> triggers = readExportTrigger(false);
+        target = target.toUpperCase();
+        PersistentExport export = new PersistentExport(target, triggers);
+        table.persistentExport = export;
+    }
+    private Statement readPersistentExport(Table table, boolean alter) {
+
+        // EXPORT TO TARGET FOO ON INSERT, DELETE, UPDATE;
+        if (token.tokenType != Tokens.EXPORT) {
+            return null;
+        }
+        String target = readMigrateTarget();
+        // read triggers
+        List<String> triggers = readExportTrigger(true);
+        Object[] args = new Object[] {
+                table.getName(),
+                target.toUpperCase(),
+                triggers,
+                Integer.valueOf(SchemaObject.CONSTRAINT), Boolean.valueOf(false),
+                Boolean.valueOf(false)
+            };
+        return new StatementSchema(null, StatementTypes.ALTER_EXPORT, args,
+                                       null, table.getName());
+    }
+
+    private List<String> readExportTrigger(boolean alter) {
+        List<String> triggers = new ArrayList<>();
+        read();
+        if (token.tokenType == Tokens.ON) {
+            read();
+            int lastTokenType = token.tokenType;
+            int endToken = (alter ? Tokens.SEMICOLON : Tokens.OPENBRACKET);
+            while (token.tokenType != endToken) {
+                String theToken = null;;
+                switch(token.tokenType) {
+                case Tokens.DELETE:
+                    theToken = Tokens.T_DELETE;
+                    break;
+                case Tokens.INSERT:
+                    theToken = Tokens.T_INSERT;
+                    break;
+                case Tokens.UPDATE:
+                    theToken = Tokens.T_UPDATE;
+                    break;
+                case Tokens.UPDATEOLD:
+                    theToken = Tokens.T_UPDATEOLD;
+                    break;
+                case Tokens.UPDATENEW:
+                    theToken = Tokens.T_UPDATENEW;
+                    break;
+                default:
+                    if (token.tokenType != Tokens.COMMA){
+                        throw unexpectedToken();
+                    }
+                }
+                if (theToken != null) {
+                    if (triggers.contains(theToken)) {
+                        throw unexpectedToken();
+                    }
+                    triggers.add(theToken);
+                }
+                read();
+
+                // Cannot have two same tokens in a row
+                if (lastTokenType == token.tokenType) {
+                    throw unexpectedToken();
+                }
+                lastTokenType = token.tokenType;
+            }
+        }
+        if (triggers.contains(Tokens.T_UPDATE) && (triggers.contains(Tokens.T_UPDATEOLD) || triggers.contains(Tokens.T_UPDATENEW))){
+            throw unexpectedToken("Cann't combine " + Tokens.T_UPDATE + " with " + Tokens.T_UPDATEOLD +
+                    " or " + Tokens.T_UPDATENEW);
+        }
+        if (triggers.contains(Tokens.T_UPDATEOLD) && triggers.contains(Tokens.T_UPDATENEW)) {
+            throw unexpectedToken("Use " + Tokens.T_UPDATE + " instead of both " + Tokens.T_UPDATEOLD +
+                    " and " + Tokens.T_UPDATENEW);
+        }
+
+        if (triggers.isEmpty()) {
+            triggers= Arrays.asList("INSERT");
+        }
+
+        return triggers;
+    }
     private Statement readTimeToLive(Table table, boolean alter) {
         //syntax: USING TTL 10 SECONDS ON COLUMN a BATCH_SIZE 1000 MAX_FREQUENCY 1 MIGRATE TO TARGET <TARGET NAME>
         if (!alter && token.tokenType != Tokens.USING) {
@@ -1019,7 +1121,6 @@ public class ParserDDL extends ParserRoutine {
         String ttlColumn = "";
         int batchSize = 1000;
         int maxFrequency = 1;
-        String migrationTarget = "";
         read();
         if (token.tokenType != Tokens.TTL) {
             throw unexpectedToken();
@@ -1058,13 +1159,42 @@ public class ParserDDL extends ParserRoutine {
             if (colType != Types.SQL_INTEGER && colType != Types.SQL_BIGINT && colType != Types.SQL_TIMESTAMP) {
                 throw unexpectedToken();
             }
+            // At this moment we don't allow alter TTL column of migrate table on the fly
+            if (alter && table.hasMigrationTarget() && !token.tokenString.equals(table.getTTL().ttlColumn.getNameString())) {
+                throw Error.error(ErrorCode.X_42581, "May not alter TTL column");
+            }
         } else {
             throw unexpectedToken();
         }
+        read();
+        if (token.tokenType == Tokens.SEMICOLON) {
+            return createTimeToLive(table, timeLiveValue, ttlUnit, ttlColumn, batchSize, maxFrequency);
+        }
+        if (token.tokenType == Tokens.BATCH_SIZE || token.tokenType == Tokens.MAX_FREQUENCY) {
+            if (token.tokenType == Tokens.BATCH_SIZE) {
+                read();
+                if (token.tokenType != Tokens.X_VALUE) {
+                    throw unexpectedToken();
+                }
+                batchSize = (Integer)(token.tokenValue);
+                if (batchSize < 1) {
+                    throw unexpectedToken("BATCH_SIZE must be a positive integer");
+                }
+            } else {
+                read();
+                if (token.tokenType != Tokens.X_VALUE) {
+                    throw unexpectedToken();
+                }
+                maxFrequency = (Integer)(token.tokenValue);
+                if (maxFrequency < 1) {
+                    throw unexpectedToken("MAX_FREQUENCY must be a positive integer");
+                }
+            }
+        }
 
         read();
         if (token.tokenType == Tokens.SEMICOLON) {
-            return createTimeToLive(table, alter, timeLiveValue, ttlUnit, ttlColumn, batchSize, maxFrequency, migrationTarget);
+            return createTimeToLive(table, timeLiveValue, ttlUnit, ttlColumn, batchSize, maxFrequency);
         }
 
         if (token.tokenType == Tokens.BATCH_SIZE || token.tokenType == Tokens.MAX_FREQUENCY) {
@@ -1085,49 +1215,15 @@ public class ParserDDL extends ParserRoutine {
             }
         }
 
-        if (token.tokenType == Tokens.MIGRATE) {
-            migrationTarget = readMigrateTarget();
-        }
-
         read();
         if (token.tokenType == Tokens.SEMICOLON) {
-            return createTimeToLive(table, alter, timeLiveValue, ttlUnit, ttlColumn, batchSize, maxFrequency, migrationTarget);
+            return createTimeToLive(table, timeLiveValue, ttlUnit, ttlColumn, batchSize, maxFrequency);
         }
 
-        if (token.tokenType == Tokens.BATCH_SIZE || token.tokenType == Tokens.MAX_FREQUENCY) {
-            read();
-            if (token.tokenType != Tokens.X_VALUE) {
-                throw unexpectedToken();
-            }
-            if (token.tokenType == Tokens.BATCH_SIZE) {
-                batchSize = (Integer)(token.tokenValue);
-                if (batchSize < 1) {
-                    throw unexpectedToken("BATCH_SIZE must be a positive integer");
-                }
-            } else {
-                maxFrequency = (Integer)(token.tokenValue);
-                if (maxFrequency < 1) {
-                    throw unexpectedToken("MAX_FREQUENCY must be a positive integer");
-                }
-            }
-        }
-
-        if (token.tokenType == Tokens.MIGRATE) {
-            migrationTarget = readMigrateTarget();
-        }
-
-        read();
-        if (token.tokenType == Tokens.SEMICOLON) {
-            return createTimeToLive(table, alter, timeLiveValue, ttlUnit, ttlColumn, batchSize, maxFrequency, migrationTarget);
-        }
-
-        if (token.tokenType == Tokens.MIGRATE) {
-            migrationTarget = readMigrateTarget();
-        }
         read();
 
       if (token.tokenType == Tokens.SEMICOLON) {
-            return createTimeToLive(table, alter, timeLiveValue, ttlUnit, ttlColumn, batchSize, maxFrequency, migrationTarget);
+            return createTimeToLive(table, timeLiveValue, ttlUnit, ttlColumn, batchSize, maxFrequency);
         } else {
             throw unexpectedToken();
         }
@@ -1148,26 +1244,9 @@ public class ParserDDL extends ParserRoutine {
         }
         return token.tokenString;
     }
-    private Statement createTimeToLive(Table table, boolean alter,int value, String unit, String column,
-            int batchSize, int maxFrequency, String migrationTargetName) {
-        if (!alter) {
-            table.addTTL(value, unit, column, batchSize, maxFrequency, migrationTargetName);
-        } else {
-            // The migration target can not be added via alter
-            if (table.getTTL() != null) {
-                final String oldTarget = table.getTTL().migrationTarget;
-                if (StringUtil.isEmpty(oldTarget) && !StringUtil.isEmpty(migrationTargetName)) {
-                    throw unexpectedToken("The migration target cannot be added.");
-                }
-
-                if (!StringUtil.isEmpty(oldTarget) && !oldTarget.equals(migrationTargetName)) {
-                    throw unexpectedToken("The migration target cannot be added.");
-                }
-
-            } else if (!StringUtil.isEmpty(migrationTargetName)) {
-                throw unexpectedToken("The migration target cannot be added.");
-            }
-        }
+    private Statement createTimeToLive(Table table, int value, String unit, String column,
+            int batchSize, int maxFrequency) {
+        table.addTTL(value, unit, column, batchSize, maxFrequency);
 
         Object[] args = new Object[] {
                 table.getName(),
@@ -1176,7 +1255,6 @@ public class ParserDDL extends ParserRoutine {
                 column,
                 batchSize,
                 maxFrequency,
-                migrationTargetName,
                 Integer.valueOf(SchemaObject.CONSTRAINT), Boolean.valueOf(false),
                 Boolean.valueOf(false)
             };
@@ -1266,6 +1344,15 @@ public class ParserDDL extends ParserRoutine {
         }
 
         int position = getPosition();
+
+        table.setHasMigrationTarget(token.tokenType == Tokens.MIGRATE);
+        if (token.tokenType == Tokens.EXPORT) {
+            // have to setup PersistentExport
+            setPeristentExportTriggers(table);
+        }
+        // skip "migrate to target" statement, it will be handled later in DDLCompiler.processCreateTableStatement
+        // We can collect the ttl first in order to decide if its a ttl migration or general migration.
+        readUntilThis(Tokens.OPENBRACKET);
 
         readThis(Tokens.OPENBRACKET);
 

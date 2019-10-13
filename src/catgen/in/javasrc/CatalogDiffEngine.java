@@ -38,6 +38,7 @@ import java.util.TreeSet;
 
 import org.apache.commons.lang3.StringUtils;
 import org.voltdb.VoltType;
+import org.voltdb.TableType;
 import org.voltdb.catalog.CatalogChangeGroup.FieldChange;
 import org.voltdb.catalog.CatalogChangeGroup.TypeChanges;
 import org.voltdb.compiler.MaterializedViewProcessor;
@@ -142,13 +143,7 @@ public class CatalogDiffEngine {
 
     // Track all new tables.  We use this to know which
     // tables do not need to be checked for emptiness.
-    // This may be redundant with m_newTablesForExport,
-    // at least in use.  That is to say, we might be able
-    // to keep only one of them.
     private final SortedSet<String> m_newTables = new TreeSet<>();
-    //Track new tables to help determine which export table is new or
-    //modified
-    private final SortedSet<String> m_newTablesForExport = new TreeSet<>();
 
     //A very rough guess at whether only deployment changes are in the catalog update
     //Can be improved as more deployment things are going to be allowed to conflict
@@ -267,7 +262,7 @@ public class CatalogDiffEngine {
         for (Map.Entry<CatalogType, TypeChanges> entry : ccg.groupChanges.entrySet()) {
             Set<String> fields = new HashSet<>();
             fields.addAll(entry.getValue().typeChanges.changedFields);
-            fields.remove(ignoredFields);
+            fields.removeAll(ignoredFields);
             if (fields.isEmpty()) {
                 groupModifications.remove(entry.getKey());
             }
@@ -509,7 +504,8 @@ public class CatalogDiffEngine {
             // So, in short, all of these constraints will pass or fail tests of other catalog differences
             // Even if they did show up as Constraints in the catalog (for no apparent functional reason),
             // flagging their changes here would be redundant.
-            suspect instanceof Constraint)
+            suspect instanceof Constraint ||
+            suspect instanceof Task)
         {
             return null;
         }
@@ -521,33 +517,26 @@ public class CatalogDiffEngine {
                 return "May not dynamically add TTl on materialized view's columns.";
             }
             // stream table can not have ttl columns
-            if (CatalogUtil.isTableExportOnly((Database)table.getParent(), table) ) {
+            if (CatalogUtil.isStream((Database)table.getParent(), table) ) {
                 return "May not dynamically add TTL on stream table's columns.";
             }
             return null;
         }
 
         else if (suspect instanceof Table) {
+            Table tbl = (Table)suspect;
+            if (TableType.isStream(tbl.getTabletype()) || TableType.needsShadowStream(tbl.getTabletype())) {
+                m_requiresNewExportGeneration = true;
+            }
+            // No special guard against dropping a table or view
+            // (although some procedures may fail to plan)
             if (ChangeType.DELETION == changeType) {
-                Table tbl = (Table)suspect;
-                if (CatalogUtil.isTableExportOnly((Database)tbl.getParent(), tbl)) {
-                    m_requiresNewExportGeneration = true;
-                }
-                // No special guard against dropping a table or view
-                // (although some procedures may fail to plan)
                 return null;
             }
-
-            Table tbl = (Table)suspect;
             String tableName = tbl.getTypeName();
 
             // Remember the name of the new table.
             m_newTables.add(tableName.toUpperCase());
-            if (CatalogUtil.isTableExportOnly((Database)tbl.getParent(), tbl)) {
-                // Remember that it's a new export table.
-                m_newTablesForExport.add(tbl.getTypeName());
-                m_requiresNewExportGeneration = true;
-            }
 
             String viewName = null;
             String sourceTableName = null;
@@ -573,7 +562,8 @@ public class CatalogDiffEngine {
                     sourceTableName = tbl.getMaterializer().getTypeName();
                 }
             }
-            if (viewName != null) {
+            // Skip guard for view on stream, given the fact that stream table is always empty
+            if (viewName != null && !TableType.isStream(tbl.getMaterializer().getTabletype())) {
                 return createViewDisallowedMessage(viewName, sourceTableName);
             }
             // Otherwise, support add/drop of the top level object.
@@ -581,6 +571,11 @@ public class CatalogDiffEngine {
         }
 
         else if (suspect instanceof Connector) {
+            m_requiresNewExportGeneration = true;
+            return null;
+        }
+
+        else if (suspect instanceof ThreadPool) {
             m_requiresNewExportGeneration = true;
             return null;
         }
@@ -624,12 +619,15 @@ public class CatalogDiffEngine {
             if (m_inStrictMatViewDiffMode) {
                 return "May not dynamically add, drop, or rename materialized view columns.";
             }
-            if (CatalogUtil.isTableExportOnly((Database)table.getParent(), table)) {
+            boolean isStreamOrStreamView = CatalogUtil.isStream((Database)table.getParent(), table)
+                    || TableType.needsShadowStream(table.getTabletype());
+            if (isStreamOrStreamView) {
                 m_requiresNewExportGeneration = true;
             }
             if (changeType == ChangeType.ADDITION) {
                 Column col = (Column) suspect;
-                if ((! col.getNullable()) && (col.getDefaultvalue() == null)) {
+                // Skip guard for view on stream, given the fact that stream table is always empty
+                if ((! col.getNullable()) && (col.getDefaultvalue() == null) && !isStreamOrStreamView) {
                     return "May not dynamically add non-nullable column without default value.";
                 }
             }
@@ -797,6 +795,9 @@ public class CatalogDiffEngine {
                     }
                 }
             }
+            if (TableType.needsShadowStream(tbl.getTabletype())) {
+                m_requiresNewExportGeneration = true;
+            }
         }
         return null;
     }
@@ -934,18 +935,8 @@ public class CatalogDiffEngine {
             suspect instanceof GroupRef ||
             suspect instanceof ColumnRef ||
             suspect instanceof Statement ||
-            suspect instanceof PlanFragment) {
-            return null;
-        }
-
-        if (suspect instanceof TimeToLive) {
-            TimeToLive current = (TimeToLive)suspect;
-            if (prevType != null) {
-                TimeToLive previous = (TimeToLive)prevType;
-                if (previous.getMigrationtarget() == null && current.getMigrationtarget() != null) {
-                    m_requiresNewExportGeneration= true;
-                }
-            }
+            suspect instanceof PlanFragment ||
+            suspect instanceof TimeToLive) {
             return null;
         }
 
@@ -978,10 +969,12 @@ public class CatalogDiffEngine {
         if (suspect instanceof Cluster && field.equals("preferredSource")) {
             return null;
         }
-        if (suspect instanceof Connector && "enabled".equals(field)) {
+        if (suspect instanceof Connector && ("enabled".equals(field) || "loaderclass".equals(field) || "threadpoolname".equals(field))) {
+            m_requiresNewExportGeneration = true;
             return null;
         }
-        if (suspect instanceof Connector && "loaderclass".equals(field)) {
+        if (suspect instanceof ThreadPool) {
+            m_requiresNewExportGeneration = true;
             return null;
         }
         // ENG-6511 Allow materialized views to change the index they use dynamically.
@@ -1031,16 +1024,32 @@ public class CatalogDiffEngine {
         if (suspect instanceof Constraint && field.equals("index"))
             return null;
         if (suspect instanceof Table) {
-            if (field.equals("signature") ||
-                field.equals("tuplelimit") || field.equals("tableType"))
+            if (field.equals("signature") || field.equals("tuplelimit") )
                 return null;
 
+            if (field.equals("tableType") && prevType != null) {
+                if (((Table)suspect).getTabletype() != ((Table)prevType).getTabletype()) {
+                    m_requiresNewExportGeneration = true;
+                    return null;
+                }
+            }
+
+            if (field.equals("migrationTarget")) {
+                if (prevType != null && ((Table) suspect).getMigrationtarget() != ((Table) prevType).getMigrationtarget()) {
+                    m_requiresNewExportGeneration = true;
+                }
+                return null;
+            }
             // Always allow disabling DR on table
             if (field.equalsIgnoreCase("isdred")) {
                 Boolean isDRed = (Boolean) suspect.getField(field);
                 assert isDRed != null;
                 if (!isDRed) return null;
             }
+        }
+
+        if (suspect instanceof Task && (field.equals("enabled") || field.equals("onError"))) {
+            return null;
         }
 
         // whitelist certain column changes
@@ -1056,8 +1065,10 @@ public class CatalogDiffEngine {
 
             // now assume parent is a Table
             Table table = (Table) parent;
-            if (CatalogUtil.isTableExportOnly((Database)table.getParent(), table)) {
+            if (TableType.needsExportDataSource(table.getTabletype())) {
                 m_requiresNewExportGeneration = true;
+                return null;
+            } else if (TableType.isConnectorLessStream(table.getTabletype())) {
                 return null;
             }
 
@@ -1893,5 +1904,4 @@ public class CatalogDiffEngine {
 
         return sb.toString();
     }
-
 }

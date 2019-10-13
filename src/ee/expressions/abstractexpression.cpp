@@ -50,6 +50,7 @@
 
 namespace voltdb {
 
+const std::vector<AbstractExpression*> AbstractExpression::empty_expression;
 // ------------------------------------------------------------------
 // AbstractExpression
 // ------------------------------------------------------------------
@@ -144,19 +145,19 @@ AbstractExpression* AbstractExpression::buildExpressionTree_recurse(PlannerDomVa
     // value and child types will have been discovered.
 
     ExpressionType peek_type = EXPRESSION_TYPE_INVALID;
-    ValueType value_type = VALUE_TYPE_INVALID;
+    ValueType value_type = ValueType::tINVALID;
     bool inBytes = false;
     AbstractExpression *left_child = NULL;
     AbstractExpression *right_child = NULL;
 
     // read the expression type
     peek_type = static_cast<ExpressionType>(obj.valueForKey("TYPE").asInt());
-    assert(peek_type != EXPRESSION_TYPE_INVALID);
+    vassert(peek_type != EXPRESSION_TYPE_INVALID);
 
     if (obj.hasNonNullKey("VALUE_TYPE")) {
         int32_t value_type_int = obj.valueForKey("VALUE_TYPE").asInt();
         value_type = static_cast<ValueType>(value_type_int);
-        assert(value_type != VALUE_TYPE_INVALID);
+        vassert(value_type != ValueType::tINVALID);
 
         if (obj.hasNonNullKey("IN_BYTES")) {
             inBytes = true;

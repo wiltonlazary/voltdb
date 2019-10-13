@@ -20,9 +20,9 @@ import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Map;
 
-import org.voltcore.messaging.HostMessenger;
-import org.voltcore.utils.Pair;
 import org.voltdb.ExportStatsBase.ExportStatsRow;
+import org.voltdb.SnapshotCompletionMonitor.ExportSnapshotTuple;
+import org.voltdb.export.ExportDataSource.StreamStartAction;
 
 /**
  * Export data from a single catalog version and database instance.
@@ -30,18 +30,27 @@ import org.voltdb.ExportStatsBase.ExportStatsRow;
  */
 public interface Generation {
 
-    public void acceptMastership(int partitionId);
-    public void close(final HostMessenger messenger);
+    public void becomeLeader(int partitionId);
+    public void close();
 
     public List<ExportStatsRow> getStats(boolean interval);
-    public void onSourceDone(int partitionId, String signature);
+    public void onSourceDrained(int partitionId, String tableName);
 
-    public void pushExportBuffer(int partitionId, String signature, long seqNo, int tupleCount,
-                                 long uniqueId, long genId, ByteBuffer buffer, boolean sync);
-    public void updateInitialExportStateToSeqNo(int partitionId, String signature,
-                                                boolean isRecover, boolean isRejoin,
-                                                Map<Integer, Pair<Long, Long>> sequenceNumberPerPartition,
-                                                boolean isLowestSite);
+    public void pushExportBuffer(int partitionId, String signature, long seqNo, long committedSeqNo,
+            int tupleCount, long uniqueId, ByteBuffer buffer);
+
+    public void updateInitialExportStateToSeqNo(int partitionId, String signature, StreamStartAction action,
+            Map<Integer, ExportSnapshotTuple> sequenceNumberPerPartition);
+
+    public void updateDanglingExportStates(StreamStartAction action,
+            Map<String, Map<Integer, ExportSnapshotTuple>> exportSequenceNumbers);
 
     public Map<Integer, Map<String, ExportDataSource>> getDataSourceByPartition();
+
+    public int getCatalogVersion();
+
+    public void updateGenerationId(long genId);
+
+    // FIXME: review if needed
+    public void sync();
 }

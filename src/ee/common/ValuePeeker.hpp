@@ -35,27 +35,27 @@ namespace voltdb {
 class ValuePeeker {
 public:
     static double peekDouble(const NValue& value) {
-        assert(value.getValueType() == VALUE_TYPE_DOUBLE);
+        vassert(value.getValueType() == ValueType::tDOUBLE);
         return value.getDouble();
     }
 
     static int8_t peekTinyInt(const NValue& value) {
-        assert(value.getValueType() == VALUE_TYPE_TINYINT);
+        vassert(value.getValueType() == ValueType::tTINYINT);
         return value.getTinyInt();
     }
 
     static int16_t peekSmallInt(const NValue& value) {
-        assert(value.getValueType() == VALUE_TYPE_SMALLINT);
+        vassert(value.getValueType() == ValueType::tSMALLINT);
         return value.getSmallInt();
     }
 
     static int32_t peekInteger(const NValue& value) {
-        assert(value.getValueType() == VALUE_TYPE_INTEGER);
+        vassert(value.getValueType() == ValueType::tINTEGER);
         return value.getInteger();
     }
 
     static bool peekBoolean(const NValue& value) {
-        assert(value.getValueType() == VALUE_TYPE_BOOLEAN);
+        vassert(value.getValueType() == ValueType::tBOOLEAN);
         return value.getBoolean();
     }
 
@@ -67,17 +67,17 @@ public:
     }
 
     static int64_t peekBigInt(const NValue& value) {
-        assert(value.getValueType() == VALUE_TYPE_BIGINT);
+        vassert(value.getValueType() == ValueType::tBIGINT);
         return value.getBigInt();
     }
 
     static int64_t peekTimestamp(const NValue& value) {
-        assert(value.getValueType() == VALUE_TYPE_TIMESTAMP);
+        vassert(value.getValueType() == ValueType::tTIMESTAMP);
         return value.getTimestamp();
     }
 
     static const char* peekObjectValue(const NValue& value) {
-        assert(isVariableLengthType(value.getValueType()));
+        vassert(isVariableLengthType(value.getValueType()));
         if (value.isNull()) {
             return NULL;
         }
@@ -86,7 +86,7 @@ public:
     }
 
     static const char* peekObject(const NValue& value, int32_t* lengthOut) {
-        assert(isVariableLengthType(value.getValueType()));
+        vassert(isVariableLengthType(value.getValueType()));
         if (value.isNull()) {
             if (lengthOut != NULL) {
                 *lengthOut = 0;
@@ -94,13 +94,13 @@ public:
             }
         }
 
-        return value.getObject_withoutNull(lengthOut);
+        return value.getObject_withoutNull(*lengthOut);
     }
 
     static const char* peekObject_withoutNull(const NValue& value, int32_t* lengthOut) {
-        assert(isVariableLengthType(value.getValueType()));
+        vassert(isVariableLengthType(value.getValueType()));
         // NEEDS WORK
-        return value.getObject_withoutNull(lengthOut);
+        return value.getObject_withoutNull(*lengthOut);
     }
 
     static ValueType peekValueType(const NValue& value) {
@@ -144,18 +144,18 @@ public:
     static const char* peekPointerToDataBytes(const NValue &value, int32_t *length) {
         ValueType vt = value.getValueType();
         switch (vt) {
-        case VALUE_TYPE_TINYINT:
-        case VALUE_TYPE_SMALLINT:
-        case VALUE_TYPE_INTEGER:
-        case VALUE_TYPE_BIGINT:
-        case VALUE_TYPE_TIMESTAMP:
-        case VALUE_TYPE_DECIMAL:
-        case VALUE_TYPE_BOOLEAN:
+            case ValueType::tTINYINT:
+            case ValueType::tSMALLINT:
+            case ValueType::tINTEGER:
+            case ValueType::tBIGINT:
+            case ValueType::tTIMESTAMP:
+            case ValueType::tDECIMAL:
+            case ValueType::tBOOLEAN:
             *length = static_cast<int32_t>(NValue::getTupleStorageSize(vt));
             return value.m_data;
 
         default:
-            assert(false);
+            vassert(false);
             return NULL;
         }
     }

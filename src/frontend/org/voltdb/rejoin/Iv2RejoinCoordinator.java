@@ -59,6 +59,8 @@ import com.google_voltpatches.common.collect.Multimap;
 public class Iv2RejoinCoordinator extends JoinCoordinator {
     private static final VoltLogger REJOINLOG = new VoltLogger("REJOIN");
 
+    static final int REJOIN_ACTION_BLOCKER_INTERVAL = Integer.getInteger("REJOIN_ACTION_BLOCKER_INTERVAL", 1000);
+
     private long m_startTime;
 
     // This lock synchronizes all data structure access. Do not hold this
@@ -126,7 +128,7 @@ public class Iv2RejoinCoordinator extends JoinCoordinator {
     {
         // We're going to share this snapshot across the provided HSIDs.
         // Steal just the first one to disabiguate it.
-        String nonce = makeSnapshotNonce("Rejoin", HSIds.get(0));
+        String nonce = SnapshotUtil.makeSnapshotNonce("Rejoin", HSIds.get(0));
         // Must not hold m_lock across the send() call to manage lock
         // acquisition ordering with other in-process mailboxes.
         synchronized (m_lock) {
@@ -153,16 +155,15 @@ public class Iv2RejoinCoordinator extends JoinCoordinator {
     private String makeSnapshotRequest(Multimap<Long, Long> sourceToDests, Long lowestSiteSinkHSId)
     {
         StreamSnapshotRequestConfig.Stream stream =
-            new StreamSnapshotRequestConfig.Stream(sourceToDests, null, lowestSiteSinkHSId);
+            new StreamSnapshotRequestConfig.Stream(sourceToDests, lowestSiteSinkHSId);
         StreamSnapshotRequestConfig config =
             new StreamSnapshotRequestConfig(SnapshotUtil.getTablesToSave(m_catalog), Arrays.asList(stream), false);
-        return makeSnapshotRequest(config);
+        return SnapshotUtil.makeSnapshotRequest(config);
     }
 
     public static void acquireLock(HostMessenger messenger )
     {
         final long maxWaitTime = TimeUnit.MINUTES.toSeconds(10); // 10 minutes
-        final long checkInterval = 1; // 1 second
 
         Stopwatch sw = Stopwatch.createStarted();
         long elapsed = 0;
@@ -180,11 +181,16 @@ public class Iv2RejoinCoordinator extends JoinCoordinator {
             }
 
             try {
-                Thread.sleep(TimeUnit.SECONDS.toMillis(checkInterval));
+                Thread.sleep(REJOIN_ACTION_BLOCKER_INTERVAL);
             } catch (InterruptedException ignoreIt) {
             }
         }
 
+        // Print out ZK info
+        StringBuilder builder = new StringBuilder("Contect on ZK:\n");
+        VoltZK.printZKDir(messenger.getZK(), VoltZK.actionBlockers, builder);
+        VoltZK.printZKDir(messenger.getZK(), VoltZK.actionLock, builder);
+        REJOINLOG.info(builder.toString());
         VoltDB.crashLocalVoltDB("Rejoin node is timed out " + maxWaitTime +
                 " seconds waiting for catalog update or elastic join, please retry node rejoin later manually.");
     }
@@ -194,7 +200,7 @@ public class Iv2RejoinCoordinator extends JoinCoordinator {
         m_catalog = catalog;
         boolean schemaHasPersistentTables = false;
         for (Table t : catalog.getTables()) {
-            if (t.getTabletype() != TableType.STREAM.get() && t.getTabletype() != TableType.STREAM_VIEW_ONLY.get()) {
+            if (t.getTabletype() != TableType.STREAM.get() && t.getTabletype() != TableType.CONNECTOR_LESS_STREAM.get()) {
                 schemaHasPersistentTables = true;
                 break;
             }
@@ -253,9 +259,7 @@ public class Iv2RejoinCoordinator extends JoinCoordinator {
         }
     }
 
-    private void onSiteInitialized(long HSId, long masterHSId, long dataSinkHSId,
-                                   boolean schemaHasPersistentTables)
-    {
+    private void onSiteInitialized(long HSId, long masterHSId, long dataSinkHSId) {
         String nonce = null;
         String data = null;
         synchronized(m_lock) {
@@ -281,7 +285,7 @@ public class Iv2RejoinCoordinator extends JoinCoordinator {
             throw new RuntimeException("Received an INITIATION_RESPONSE for an HSID for which no nonce exists: " +
                     CoreUtils.hsIdToString(HSId));
         }
-        if (data != null && schemaHasPersistentTables) {
+        if (data != null) {
             REJOINLOG.debug("Snapshot request: " + data);
             SnapshotUtil.requestSnapshot(0l, "", nonce, !m_liveRejoin, SnapshotFormat.STREAM, SnapshotPathType.SNAP_NO_PATH, data,
                     SnapshotUtil.fatalSnapshotResponseHandler, true);
@@ -305,8 +309,7 @@ public class Iv2RejoinCoordinator extends JoinCoordinator {
             assert(m_catalog != null);
             onReplayFinished(rm.m_sourceHSId);
         } else if (type == RejoinMessage.Type.INITIATION_RESPONSE) {
-            onSiteInitialized(rm.m_sourceHSId, rm.getMasterHSId(), rm.getSnapshotSinkHSId(),
-                              rm.schemaHasPersistentTables());
+            onSiteInitialized(rm.m_sourceHSId, rm.getMasterHSId(), rm.getSnapshotSinkHSId());
         } else {
             VoltDB.crashLocalVoltDB("Wrong rejoin message of type " + type +
                                     " sent to the rejoin coordinator", false, null);

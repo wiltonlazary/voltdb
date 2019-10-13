@@ -23,7 +23,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import org.voltcore.utils.DBBPool.BBContainer;
 import org.voltdb.VoltDB;
+import org.voltdb.exportclient.ExportRowSchema;
 import org.voltdb.iv2.UniqueIdGenerator;
+import org.voltdb.utils.BinaryDequeReader;
 
 /*
  * The stream block has a default reference count of 1 for being in the queue.
@@ -46,23 +48,25 @@ import org.voltdb.iv2.UniqueIdGenerator;
  */
 public class StreamBlock {
 
-    public static final int HEADER_SIZE = 20; //sequence number(8) + row count(4) + uniqueId(8)
+    // start seq number(8) + committed seq number (8) + row count(4) + uniqueId (8)
+    public static final int HEADER_SIZE = 28;
     public static final int SEQUENCE_NUMBER_OFFSET = 0;
-    public static final int ROW_NUMBER_OFFSET = 8;
-    public static final int UNIQUE_ID_OFFSET = 12;
+    public static final int COMMIT_SEQUENCE_NUMBER_OFFSET = 8;
+    public static final int ROW_NUMBER_OFFSET = 16;
+    public static final int UNIQUE_ID_OFFSET = 20;
 
-    StreamBlock(BBContainer fcont, BBContainer schemaCont, long startSequenceNumber, int rowCount,
-            long uniqueId, long segmentIndex, boolean isPersisted) {
-        m_buffer = fcont;
-        m_schema = schemaCont;
+    public StreamBlock(BinaryDequeReader.Entry<ExportRowSchema> entry, long startSequenceNumber, long committedSequenceNumber,
+            int rowCount, long uniqueId, boolean isPersisted) {
+        assert(entry != null);
+        m_entry  = entry;
         m_startSequenceNumber = startSequenceNumber;
+        m_committedSequenceNumber = committedSequenceNumber;
         m_rowCount = rowCount;
         m_uniqueId = uniqueId;
         // The first 20 bytes are space for us to store the sequence number, row count and uniqueId
         // if we end up persisting
-        m_buffer.b().position(HEADER_SIZE);
-        m_totalSize = m_buffer.b().remaining();
-        m_segmentIndex = segmentIndex;
+        m_entry.getData().position(HEADER_SIZE);
+        m_totalSize = m_entry.getData().remaining();
         //The first 8 bytes are space for us to store the sequence number if we end up persisting
         m_isPersisted = isPersisted;
     }
@@ -72,37 +76,45 @@ public class StreamBlock {
     /*
      * Call discard on the underlying buffer used for storage
      */
-    void discard() {
+    public void discard() {
         final int count = m_refCount.decrementAndGet();
         if (count == 0) {
-            m_buffer.discard();
-            m_buffer = null;
-            if (m_schema != null) {
-                m_schema.discard();
-                m_schema = null;
-            }
+            m_entry.release();
         } else if (count < 0) {
             VoltDB.crashLocalVoltDB("Broken refcounting in export", true, null);
         }
     }
 
-    long startSequenceNumber() {
+    public boolean canRelease() {
+        return m_refCount.get() == 1;
+    }
+
+    public ExportRowSchema getSchema() {
+        return m_entry.getExtraHeader();
+    }
+
+    public long startSequenceNumber() {
         return m_startSequenceNumber;
     }
 
-    long lastSequenceNumber() {
+    public long lastSequenceNumber() {
         return m_startSequenceNumber + m_rowCount - 1;
+    }
+
+
+    public long committedSequenceNumber() {
+        return m_committedSequenceNumber;
     }
 
     /**
      * Returns the sequence number of the first unreleased export row in this block
      */
-    long unreleasedSequenceNumber()
+    public long unreleasedSequenceNumber()
     {
         return m_startSequenceNumber + m_releaseOffset + 1;
     }
 
-    int rowCount() {
+    public int rowCount() {
         return m_rowCount;
     }
 
@@ -110,7 +122,7 @@ public class StreamBlock {
         return m_uniqueId;
     }
 
-    long getTimestamp() {
+    public long getTimestamp() {
         return UniqueIdGenerator.getTimestampFromUniqueId(m_uniqueId) * 1000;
     }
 
@@ -118,7 +130,7 @@ public class StreamBlock {
      * Returns the total amount of bytes in the stream
      * @return
      */
-    long totalSize() {
+    public long totalSize() {
         return m_totalSize;
     }
 
@@ -131,7 +143,7 @@ public class StreamBlock {
     }
 
     // The sequence number for export rows up to which are being released
-    void releaseTo(long releaseSequenceNumber)
+    public void releaseTo(long releaseSequenceNumber)
     {
         assert(releaseSequenceNumber >= m_startSequenceNumber);
         m_releaseOffset = (int)(releaseSequenceNumber - m_startSequenceNumber);
@@ -144,15 +156,13 @@ public class StreamBlock {
     }
 
     private final long m_startSequenceNumber;
+    private long m_committedSequenceNumber;
     private final int m_rowCount;
     private final long m_uniqueId;
     private final long m_totalSize;
-    private BBContainer m_buffer;
-    private BBContainer m_schema;
+    private BinaryDequeReader.Entry<ExportRowSchema> m_entry;
     // index of the last row that has been released.
     private int m_releaseOffset = -1;
-    // reverse lookup to find pbd segment
-    private long m_segmentIndex = -1;
 
     /*
      * True if this block is still backed by a file and false
@@ -160,17 +170,9 @@ public class StreamBlock {
      */
     private final boolean m_isPersisted;
 
-    BBContainer unreleasedContainer() {
+    public BBContainer unreleasedContainer() {
         m_refCount.incrementAndGet();
-        return getRefCountingContainer(m_buffer.b().slice().asReadOnlyBuffer());
-    }
-
-    BBContainer getSchemaContainer() {
-        if (m_schema == null) {
-            return null;
-        }
-        m_refCount.incrementAndGet();
-        return getRefCountingContainer(m_schema.b().slice().asReadOnlyBuffer());
+        return getRefCountingContainer(m_entry.getData().slice().asReadOnlyBuffer());
     }
 
     private BBContainer getRefCountingContainer(ByteBuffer buf) {
@@ -183,21 +185,21 @@ public class StreamBlock {
         };
     }
 
-    /*
+    /**
+     * Put header data at the start of the ByteBuffer and return a container wrapping it for read-only access.
+     *
      * Does not increment the refcount, uses the implicit 1 count
-     * and should only be called once to get a container for pushing the data to disk
+     * and should only be called once to get a container for pushing the data to disk.
      */
-    BBContainer asBBContainer() {
-        m_buffer.b().order(ByteOrder.LITTLE_ENDIAN);
-        m_buffer.b().putLong(SEQUENCE_NUMBER_OFFSET, startSequenceNumber());
-        m_buffer.b().putInt(ROW_NUMBER_OFFSET, rowCount());
-        m_buffer.b().putLong(UNIQUE_ID_OFFSET, uniqueId());
-        m_buffer.b().position(SEQUENCE_NUMBER_OFFSET);
-        m_buffer.b().order(ByteOrder.BIG_ENDIAN);
-        return getRefCountingContainer(m_buffer.b().asReadOnlyBuffer());
-    }
-
-    public long getSegmentIndex() {
-        return m_segmentIndex;
+    public BBContainer asBBContainer() {
+        ByteBuffer b = m_entry.getData();
+        b.order(ByteOrder.LITTLE_ENDIAN);
+        b.putLong(SEQUENCE_NUMBER_OFFSET, startSequenceNumber());
+        b.putLong(COMMIT_SEQUENCE_NUMBER_OFFSET, committedSequenceNumber());
+        b.putInt(ROW_NUMBER_OFFSET, rowCount());
+        b.putLong(UNIQUE_ID_OFFSET, uniqueId());
+        b.position(SEQUENCE_NUMBER_OFFSET);
+        b.order(ByteOrder.BIG_ENDIAN);
+        return getRefCountingContainer(b.asReadOnlyBuffer());
     }
 }

@@ -62,24 +62,20 @@ namespace voltdb {
  * utility functions getRandomTuple and the like to work.
  */
 class JumpingTableIterator : public TableIterator {
+    TBMapI m_end;        // Use here for easy access to end()
 public:
     JumpingTableIterator(PersistentTable* table);
     int getTuplesInNextBlock();
     bool hasNextBlock();
     void nextBlock();
-
-private:
-    TBMapI m_end;        // Use here for easy access to end()
 };
 
 inline JumpingTableIterator::JumpingTableIterator(PersistentTable* parent)
-    : TableIterator((Table*)parent, parent->m_data.begin())
-    , m_end(parent->m_data.end())
-{
+    : TableIterator((Table*)parent, parent->m_data.begin()) , m_end(parent->m_data.end()) {
 }
 
 inline int JumpingTableIterator::getTuplesInNextBlock() {
-    assert(getBlockIterator() != m_end);
+    vassert(getBlockIterator() != m_end);
     return getBlockIterator().data()->activeTuples();
 }
 
@@ -88,7 +84,7 @@ inline bool JumpingTableIterator::hasNextBlock() {
 }
 
 inline void JumpingTableIterator::nextBlock() {
-    assert(getBlockIterator() != m_end);
+    vassert(getBlockIterator() != m_end);
     TBPtr currentBlock = getBlockIterator().data();
     auto blockIt = getBlockIterator();
     ++blockIt;
@@ -96,12 +92,11 @@ inline void JumpingTableIterator::nextBlock() {
     setFoundTuples(getFoundTuples() + currentBlock->activeTuples());
 }
 
-bool tableutil::getRandomTuple(const voltdb::PersistentTable* table, voltdb::TableTuple &out)
-{
+bool tableutil::getRandomTuple(const voltdb::PersistentTable* table, voltdb::TableTuple &out) {
     voltdb::PersistentTable* table2 = const_cast<voltdb::PersistentTable*>(table);
     int cnt = (int)table->visibleTupleCount();
     if (cnt > 0) {
-        int idx = (rand() % cnt);
+        int idx = rand() % cnt;
         JumpingTableIterator it(table2);
         while (it.hasNextBlock() && it.getTuplesInNextBlock() <= idx) {
             idx -= it.getTuplesInNextBlock();
@@ -118,8 +113,7 @@ bool tableutil::getRandomTuple(const voltdb::PersistentTable* table, voltdb::Tab
     return false;
 }
 
-bool tableutil::getLastTuple(const voltdb::PersistentTable* table, voltdb::TableTuple &out)
-{
+bool tableutil::getLastTuple(const voltdb::PersistentTable* table, voltdb::TableTuple &out) {
     voltdb::PersistentTable* table2 = const_cast<voltdb::PersistentTable*>(table);
     int cnt = (int)table->visibleTupleCount();
     if (cnt > 0) {
@@ -132,7 +126,7 @@ bool tableutil::getLastTuple(const voltdb::PersistentTable* table, voltdb::Table
         while (it.next(out)) {
             if (idx-- == 0) {
                 voltdb::TableTuple tmp;
-                assert(!it.next(tmp));
+                vassert(!it.next(tmp));
                 return true;
             }
         }
@@ -142,10 +136,9 @@ bool tableutil::getLastTuple(const voltdb::PersistentTable* table, voltdb::Table
     return false;
 }
 
-void tableutil::setRandomTupleValues(Table* table, TableTuple *tuple)
-{
-    assert(table);
-    assert(tuple);
+void tableutil::setRandomTupleValues(Table* table, TableTuple *tuple) {
+    vassert(table);
+    vassert(tuple);
     for (int col_ctr = 0, col_cnt = table->columnCount(); col_ctr < col_cnt; col_ctr++) {
         const TupleSchema::ColumnInfo *columnInfo = table->schema()->getColumnInfo(col_ctr);
         NValue value = ValueFactory::getRandomValue(columnInfo->getVoltType(), columnInfo->length);
@@ -160,15 +153,15 @@ void tableutil::setRandomTupleValues(Table* table, TableTuple *tuple)
         const TupleSchema::ColumnInfo *tupleColumnInfo = tuple->getSchema()->getColumnInfo(col_ctr);
 
         const ValueType t = tupleColumnInfo->getVoltType();
-        if (((t == VALUE_TYPE_VARCHAR) || (t == VALUE_TYPE_VARBINARY)) && tupleColumnInfo->inlined) {
+        if ((t == ValueType::tVARCHAR || t == ValueType::tVARBINARY) &&
+                tupleColumnInfo->inlined) {
             value.free();
         }
     }
 }
 
-bool tableutil::addRandomTuples(Table* table, int num_of_tuples)
-{
-    assert(num_of_tuples >= 0);
+bool tableutil::addRandomTuples(Table* table, int num_of_tuples) {
+    vassert(num_of_tuples >= 0);
     for (int ctr = 0; ctr < num_of_tuples; ctr++) {
         TableTuple &tuple = table->tempTuple();
         setRandomTupleValues(table, &tuple);
@@ -188,9 +181,8 @@ bool tableutil::addRandomTuples(Table* table, int num_of_tuples)
     return true;
 }
 
-bool tableutil::addDuplicateRandomTuples(Table* table, int num_of_tuples)
-{
-    assert(num_of_tuples > 1);
+bool tableutil::addDuplicateRandomTuples(Table* table, int num_of_tuples) {
+    vassert(num_of_tuples > 1);
     TableTuple &tuple = table->tempTuple();
     setRandomTupleValues(table, &tuple);
     for (int ctr = 0; ctr < num_of_tuples; ctr++) {

@@ -48,9 +48,7 @@ public:
     void pushExportBuffer(
             int32_t partitionId,
             std::string signature,
-            ExportStreamBlock *block,
-            bool sync,
-            int64_t generationId);
+            ExportStreamBlock *block);
     void pushEndOfStream(
             int32_t partitionId,
             std::string signature);
@@ -76,6 +74,11 @@ public:
     bool releaseLargeTempTableBlock(LargeTempTableBlockId blockId);
 
     int32_t callJavaUserDefinedFunction();
+    int32_t callJavaUserDefinedAggregateStart(int functionId);
+    int32_t callJavaUserDefinedAggregateAssemble();
+    int32_t callJavaUserDefinedAggregateCombine();
+    int32_t callJavaUserDefinedAggregateWorkerEnd();
+    int32_t callJavaUserDefinedAggregateCoordinatorEnd();
     void resizeUDFBuffer(int32_t size);
 
 private:
@@ -86,6 +89,7 @@ private:
      * if this is NULL, VoltDBEngine will fail to call sendDependency().
     */
     jobject m_javaExecutionEngine;
+    jclass m_jniClass;
     jmethodID m_fallbackToEEAllocatedBufferMID;
     jmethodID m_nextDependencyMID;
     jmethodID m_traceLogMID;
@@ -99,6 +103,11 @@ private:
     jmethodID m_reportDRConflictMID;
     jmethodID m_decodeBase64AndDecompressToBytesMID;
     jmethodID m_callJavaUserDefinedFunctionMID;
+    jmethodID m_callJavaUserDefinedAggregateStartMID;
+    jmethodID m_callJavaUserDefinedAggregateAssembleMID;
+    jmethodID m_callJavaUserDefinedAggregateCombineMID;
+    jmethodID m_callJavaUserDefinedAggregateWorkerEndMID;
+    jmethodID m_callJavaUserDefinedAggregateCoordinatorEndMID;
     jmethodID m_resizeUDFBufferMID;
     jmethodID m_storeLargeTempTableBlockMID;
     jmethodID m_loadLargeTempTableBlockMID;
@@ -106,6 +115,7 @@ private:
     jclass m_exportManagerClass;
     jclass m_partitionDRGatewayClass;
     jclass m_decompressionClass;
+    jmethodID initJavaUserDefinedMethod(const char* name);
 };
 
 }

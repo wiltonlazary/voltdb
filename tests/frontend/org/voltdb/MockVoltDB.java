@@ -59,6 +59,7 @@ import org.voltdb.catalog.Table;
 import org.voltdb.compiler.deploymentfile.DeploymentType;
 import org.voltdb.compiler.deploymentfile.PathsType;
 import org.voltdb.dtxn.SiteTracker;
+import org.voltdb.elastic.ElasticService;
 import org.voltdb.iv2.Cartographer;
 import org.voltdb.iv2.SpScheduler.DurableUniqueIdListener;
 import org.voltdb.licensetool.LicenseApi;
@@ -67,6 +68,7 @@ import org.voltdb.settings.DbSettings;
 import org.voltdb.settings.NodeSettings;
 import org.voltdb.snmp.DummySnmpTrapSender;
 import org.voltdb.snmp.SnmpTrapSender;
+import org.voltdb.task.TaskManager;
 import org.voltdb.utils.HTTPAdminListener;
 
 import com.google_voltpatches.common.util.concurrent.ListenableFuture;
@@ -789,6 +791,58 @@ public class MockVoltDB implements VoltDBInterface
             public boolean secondaryInitialization() {
                 return true;
             }
+
+            @Override
+            public String getSignature() {
+                return null;
+            }
+
+            @Override
+            public String getLicenseType() {
+                return null;
+            }
+
+            @Override
+            public boolean isUnrestricted()
+            {
+                return false;
+            }
+
+            @Override
+            public String getIssuerCompany()
+            {
+                return null;
+            }
+
+            @Override
+            public String getIssuerUrl()
+            {
+                return null;
+            }
+
+            @Override
+            public String getIssuerEmail()
+            {
+                return null;
+            }
+
+            @Override
+            public String getIssuerPhone()
+            {
+                return null;
+            }
+
+            @Override
+            public int getVersion()
+            {
+                return 0;
+            }
+
+            @Override
+            public int getScheme()
+            {
+                return 0;
+            }
         };
     }
 
@@ -891,4 +945,23 @@ public class MockVoltDB implements VoltDBInterface
 
     @Override
     public boolean isJoining() {return false;}
+
+    @Override
+    public ElasticService getElasticService() {
+        return null;
+    }
+
+    @Override
+    public boolean isClusterComplete() {
+        return true;
+    }
+
+    @Override
+    public TaskManager getTaskManager() {
+        return null;
+    }
+
+    @Override
+    public void notifyOfShutdown() {
+     }
 }

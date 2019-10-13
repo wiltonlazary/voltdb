@@ -53,7 +53,7 @@ public:
 
     virtual ~AbstractDRTupleStream() {}
 
-    void pushStreamBuffer(DrStreamBlock *block, bool sync);
+    void pushStreamBuffer(DrStreamBlock *block);
 
     /** truncate stream back to mark (only virtual for Mock override) */
     inline void rollbackDrTo(size_t mark, size_t drRowCost)
@@ -71,11 +71,11 @@ public:
             m_txnRowCount -= drRowCost;
         } else {
             // convenience to let us just throw away everything at once
-            assert(drRowCost == SIZE_MAX);
+            vassert(drRowCost == SIZE_MAX);
             m_txnRowCount = 0;
         }
         if (mark == m_committedUso) {
-            assert(m_txnRowCount == 0);
+            vassert(m_txnRowCount == 0);
             m_openSequenceNumber = m_committedSequenceNumber;
             m_opened = false;
         }
@@ -99,29 +99,18 @@ public:
      * write an insert or delete record to the stream
      * for active-active conflict detection purpose, write full row image for delete records.
      * */
-    virtual size_t appendTuple(char *tableHandle,
-                               int partitionColumn,
-                               int64_t spHandle,
-                               int64_t uniqueId,
-                               TableTuple &tuple,
-                               DRRecordType type) = 0;
+    virtual size_t appendTuple(char *tableHandle, int partitionColumn, int64_t spHandle,
+            int64_t uniqueId, TableTuple &tuple, DRRecordType type) = 0;
 
     /**
      * write an update record to the stream
      * for active-active conflict detection purpose, write full before image for update records.
      * */
-    virtual size_t appendUpdateRecord(char *tableHandle,
-                                      int partitionColumn,
-                                      int64_t spHandle,
-                                      int64_t uniqueId,
-                                      TableTuple &oldTuple,
-                                      TableTuple &newTuple) = 0;
+    virtual size_t appendUpdateRecord(char *tableHandle, int partitionColumn, int64_t spHandle,
+            int64_t uniqueId, TableTuple &oldTuple, TableTuple &newTuple) = 0;
 
-    virtual size_t truncateTable(char *tableHandle,
-                                 std::string tableName,
-                                 int partitionColumn,
-                                 int64_t spHandle,
-                                 int64_t uniqueId) = 0;
+    virtual size_t truncateTable(char *tableHandle, std::string const& tableName,
+            int partitionColumn, int64_t spHandle, int64_t uniqueId) = 0;
 
     virtual void beginTransaction(int64_t sequenceNumber, int64_t spHandle, int64_t uniqueId) = 0;
     // If a transaction didn't generate any binary log data, calling this
@@ -133,14 +122,14 @@ public:
 
     virtual DRCommittedInfo getLastCommittedSequenceNumberAndUniqueIds() = 0;
 
-    virtual void generateDREvent(DREventType type, int64_t lastCommittedSpHandle, int64_t spHandle,
+    virtual void generateDREvent(DREventType type, int64_t spHandle,
                                  int64_t uniqueId, ByteArray payloads) = 0;
 
-    bool drStreamStarted() {
-        return (m_committedSequenceNumber >= 0);
+    bool drStreamStarted() const {
+        return m_committedSequenceNumber >= 0;
     }
 
-    virtual void setDrProtocolVersion(uint8_t drProtocolVersion) {
+    void setDrProtocolVersion(uint8_t drProtocolVersion) {
         m_drProtocolVersion = drProtocolVersion;
     }
 

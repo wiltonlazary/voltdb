@@ -32,9 +32,9 @@ import java.util.BitSet;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentLinkedDeque;
-import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Function;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Predicate;
 
 import org.aeonbits.owner.Accessible;
 import org.aeonbits.owner.ConfigFactory;
@@ -47,9 +47,12 @@ import org.voltdb.client.BatchTimeoutOverrideType;
 import org.voltdb.client.ClientResponse;
 import org.voltdb.client.ProcedureCallback;
 import org.voltdb.export.AdvertisedDataSource;
+import org.voltdb.export.ExportManagerInterface;
+import org.voltdb.export.ExportManagerInterface.ExportMode;
 import org.voltdb.exportclient.ExportClientBase;
 import org.voltdb.exportclient.ExportClientLogger;
 import org.voltdb.exportclient.ExportDecoderBase;
+import org.voltdb.exportclient.ExportRow;
 import org.voltdb.exportclient.decode.CSVWriterDecoder;
 
 import com.google_voltpatches.common.base.Supplier;
@@ -57,7 +60,6 @@ import com.google_voltpatches.common.base.Suppliers;
 import com.google_voltpatches.common.util.concurrent.ListeningExecutorService;
 
 import au.com.bytecode.opencsv_voltpatches.CSVWriter;
-import org.voltdb.exportclient.ExportRow;
 
 public class LoopbackExportClient extends ExportClientBase {
 
@@ -66,6 +68,7 @@ public class LoopbackExportClient extends ExportClientBase {
     private String m_procedure;
     private String m_failureLog;
     private File m_rejectedDH;
+    private boolean m_skipInternals = true;
 
     public LoopbackExportClient() {
     }
@@ -73,9 +76,13 @@ public class LoopbackExportClient extends ExportClientBase {
     public interface Config extends Accessible {
         final static String PROCEDURE = "procedure";
         final static String FAILURE_LOG_FILE = "failurelogfile";
+        final static String SKIP_INTERNALS = "skipinternals";
 
         @Key(PROCEDURE)
         public String getProcedureName();
+
+        @Key(SKIP_INTERNALS)
+        public String getSkipInternals();
 
         @Key(FAILURE_LOG_FILE)
         public String getFailureLogFile();
@@ -94,6 +101,12 @@ public class LoopbackExportClient extends ExportClientBase {
         Config config = Config.create(props);
         checkArgument(isNotBlank(config.getProcedureName()), "procedure name is not defined");
         m_procedure = config.getProcedureName();
+
+        String skipVal = config.getSkipInternals();
+        if (skipVal != null && !skipVal.isEmpty()) {
+            m_skipInternals = Boolean.parseBoolean(skipVal);
+        }
+
         m_failureLog = config.getFailureLogFile();
         if (m_failureLog != null && m_failureLog.trim().length() > 0) {
             File rejectedDH = new File(m_failureLog);
@@ -131,7 +144,7 @@ public class LoopbackExportClient extends ExportClientBase {
         private final ListeningExecutorService m_es;
         private final AuthUser m_user;
         private final InternalConnectionHandler m_invoker;
-        private final Function<Integer, Boolean> m_shouldContinue;
+        private final Predicate<Integer> m_shouldContinue;
 
         private BitSet m_failed = new BitSet(0);
         private BitSet m_resubmit = new BitSet(0);
@@ -139,6 +152,7 @@ public class LoopbackExportClient extends ExportClientBase {
         private BlockContext m_ctx;
         private boolean m_restarted = false;
         private boolean m_wrote = false;
+        private volatile boolean m_isShutDown;
 
         private final Supplier<CSVWriter> m_rejs;
 
@@ -172,24 +186,37 @@ public class LoopbackExportClient extends ExportClientBase {
             CSVWriterDecoder.Builder builder = new CSVWriterDecoder.Builder();
             builder
                 .dateFormatter(tmpl)
-                .skipInternalFields(true)
+                .skipInternalFields(m_skipInternals)
             ;
             m_csvWriterDecoder = builder.build();
-            m_es = CoreUtils.getListeningSingleThreadExecutor(
-                    "Loopback Export decoder for partition " + source.partitionId, CoreUtils.MEDIUM_STACK_SIZE);
+            if (ExportManagerInterface.instance().getExportMode() == ExportMode.BASIC) {
+                m_es = CoreUtils.getListeningSingleThreadExecutor(
+                        "Loopback Export decoder for partition " + source.partitionId, CoreUtils.MEDIUM_STACK_SIZE);
+            } else {
+                m_es = null;
+            }
             m_user = getVoltDB().getCatalogContext().authSystem.getImporterUser();
             m_invoker = getVoltDB().getClientInterface().getInternalConnectionHandler();
-            m_shouldContinue = (x) -> !m_es.isShutdown();
+            m_shouldContinue = (x) -> !isShutDown();
+        }
+
+        public boolean isShutDown() {
+            return m_isShutDown;
         }
 
         @Override
         public void onBlockCompletion(ExportRow row) throws RestartBlockException {
-            if (m_ctx.invokes > 0) {
-                try {
-                    m_ctx.m_done.acquire(m_ctx.invokes);
-                } catch (InterruptedException e) {
-                    throw new LoopbackExportException("failed to wait for block callback", e);
+            synchronized (this) {
+                if (m_ctx.m_outstandingTransactions.get() > 0 && !m_isShutDown) {
+                    try {
+                        wait();
+                    } catch (InterruptedException e) {
+                        throw new LoopbackExportException("failed to wait for block callback", e);
+                    }
                 }
+            }
+            if (m_isShutDown) { // if shut down, the GuestProcessor will always re-process the block when it's up
+                return;
             }
             m_restarted = !m_ctx.m_rq.isEmpty();
 
@@ -233,15 +260,15 @@ public class LoopbackExportClient extends ExportClientBase {
                 }
                 return true;
             }
+            int firstFieldOffset = m_skipInternals ? INTERNAL_FIELD_COUNT : 0;
             LoopbackCallback cb = m_ctx.createCallback(bix);
             if (m_invoker.callProcedure(m_user, false,
                     BatchTimeoutOverrideType.NO_TIMEOUT,
                     cb, false, m_shouldContinue, m_procedure,
-                    Arrays.copyOfRange(rd.values, 6, rd.values.length))) {
-                ++m_ctx.invokes;
+                    Arrays.copyOfRange(rd.values, firstFieldOffset, rd.values.length))) {
+                m_ctx.m_outstandingTransactions.getAndIncrement();
             } else {
                 LOG.error("failed to Invoke procedure: " + m_procedure);
-                m_ctx.m_done.release();
             }
 
             return true;
@@ -254,11 +281,17 @@ public class LoopbackExportClient extends ExportClientBase {
                     m_rejs.get().close();
                 } catch (IOException ignoreIt) {}
             }
-            m_es.shutdown();
-            try {
-                m_es.awaitTermination(365, TimeUnit.DAYS);
-            } catch (InterruptedException e) {
-                LOG.error("Interrupted while awaiting executor shutdown", e);
+            synchronized(this) {
+                m_isShutDown = true;
+                notifyAll();
+            }
+            if (m_es != null) {
+                m_es.shutdown();
+                try {
+                    m_es.awaitTermination(365, TimeUnit.DAYS);
+                } catch (InterruptedException e) {
+                    LOG.error("Interrupted while awaiting executor shutdown", e);
+                }
             }
         }
 
@@ -269,14 +302,14 @@ public class LoopbackExportClient extends ExportClientBase {
 
         class LoopbackCallback implements ProcedureCallback {
 
-            private final Semaphore m_done;
+            private final AtomicInteger m_outstandingTransactions;
             private final ConcurrentLinkedDeque<Reject> m_rq;
             private final int m_bix;
 
-            LoopbackCallback(Semaphore done,
+            LoopbackCallback(AtomicInteger oustandingTransactions,
                     ConcurrentLinkedDeque<Reject> rq,
                     int bix) {
-                this.m_done = done;
+                this.m_outstandingTransactions = oustandingTransactions;
                 this.m_rq = rq;
                 this.m_bix = bix;
             }
@@ -295,19 +328,22 @@ public class LoopbackExportClient extends ExportClientBase {
                         LOG.error("Loopback Invocation failed: %s", cr.getStatusString());
                     }
                 } finally {
-                    m_done.release();
+                    if (m_outstandingTransactions.decrementAndGet() == 0) {
+                        synchronized(LoopbackExportDecoder.this) {
+                            LoopbackExportDecoder.this.notifyAll();
+                        }
+                    }
                 }
             }
         }
 
         class BlockContext {
-            final Semaphore m_done = new Semaphore(0);
             final ConcurrentLinkedDeque<Reject> m_rq = new ConcurrentLinkedDeque<>();
             int recs = 0;
-            int invokes = 0;
+            final AtomicInteger m_outstandingTransactions = new AtomicInteger();
 
             LoopbackCallback createCallback(int bix) {
-                return new LoopbackCallback(m_done, m_rq, bix);
+                return new LoopbackCallback(m_outstandingTransactions, m_rq, bix);
             }
         }
 

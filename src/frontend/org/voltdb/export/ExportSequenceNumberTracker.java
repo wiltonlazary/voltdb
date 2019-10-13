@@ -17,8 +17,12 @@
 
 package org.voltdb.export;
 
+import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.Iterator;
+import java.util.Set;
 
+import org.voltcore.utils.DeferredSerialization;
 import org.voltcore.utils.Pair;
 
 import com.google_voltpatches.common.collect.BoundType;
@@ -27,10 +31,14 @@ import com.google_voltpatches.common.collect.Range;
 import com.google_voltpatches.common.collect.RangeSet;
 import com.google_voltpatches.common.collect.TreeRangeSet;
 
-public class ExportSequenceNumberTracker {
+public class ExportSequenceNumberTracker implements DeferredSerialization {
+    // using Long.MAX_VALUE throws IllegalStateException in Range.java.
+    public static final long INFINITE_SEQNO = Long.MAX_VALUE - 1;
+    public static final long MIN_SEQNO = 1L;
+
     protected RangeSet<Long> m_map;
     // Is the first sequence a sentinel? Sentinel doesn't count into the total sequence size of tracker.
-    private boolean m_hasSentinel = false;
+    protected boolean m_hasSentinel = false;
 
     /**
      * Returns a canonical range that can be added to the internal range
@@ -52,7 +60,7 @@ public class ExportSequenceNumberTracker {
      * @param range
      * @return Start of the range
      */
-    private static long start(Range<Long> range) {
+    public static long start(Range<Long> range) {
         if (range.lowerBoundType() == BoundType.OPEN) {
             return DiscreteDomain.longs().next(range.lowerEndpoint());
         } else {
@@ -66,7 +74,7 @@ public class ExportSequenceNumberTracker {
      * @param range
      * @return End of the range
      */
-    private static long end(Range<Long> range) {
+    public static long end(Range<Long> range) {
         if (range.upperBoundType() == BoundType.OPEN) {
             return DiscreteDomain.longs().previous(range.upperEndpoint());
         } else {
@@ -80,6 +88,18 @@ public class ExportSequenceNumberTracker {
 
     public ExportSequenceNumberTracker(ExportSequenceNumberTracker other) {
         m_map = TreeRangeSet.create(other.m_map);
+    }
+
+    public ExportSequenceNumberTracker(ByteBuffer buf) throws IOException {
+
+        m_map = TreeRangeSet.create();
+        int count = buf.getInt();
+        for (int i = 0; i < count; i++) {
+            long start = buf.getLong();
+            long end = buf.getLong();
+            append(start, end);
+        }
+        m_hasSentinel = buf.get() == 1;
     }
 
     public int size() {
@@ -96,16 +116,14 @@ public class ExportSequenceNumberTracker {
         Range<Long> newRange = range(start, end);
         long nonOverlapSize = end - start + 1;
         if (m_map.intersects(newRange)) {
-            final Iterator<Range<Long>> iter = m_map.asRanges().iterator();
-            while (iter.hasNext()) {
-                final Range<Long> next = iter.next();
-                Range<Long> intersection = next.intersection(newRange);
-                if (intersection != null) {
-                    nonOverlapSize -= end(intersection) - start(intersection) + 1;
-                }
-            }
+             for (Range<Long> next : m_map.asRanges()) {
+                 if (next.isConnected(newRange)) {
+                     Range<Long> intersection = next.intersection(newRange);
+                     nonOverlapSize -= end(intersection) - start(intersection) + 1;
+                 }
+             }
         }
-        m_map.add(range(start, end));
+        m_map.add(newRange);
         return nonOverlapSize;
     }
 
@@ -163,6 +181,10 @@ public class ExportSequenceNumberTracker {
             m_hasSentinel = true;
         }
         return truncated;
+    }
+
+    public Set<Range<Long>> getRanges() {
+        return m_map.asRanges();
     }
 
     /**
@@ -227,7 +249,6 @@ public class ExportSequenceNumberTracker {
      *         otherwise return null
      */
     public Pair<Long, Long> getRangeContaining(long seq) {
-        assert (!m_map.isEmpty());
         Range<Long> range = m_map.rangeContaining(seq);
         if (range != null) {
             return new Pair<Long, Long>(start(range), end(range));
@@ -252,17 +273,59 @@ public class ExportSequenceNumberTracker {
      *         exist return null
      */
     public Pair<Long, Long> getFirstGap() {
-        if (m_map.isEmpty() || size() < 2) {
-            return null;
-        }
-        Iterator<Range<Long>> iter = m_map.asRanges().iterator();
-        long start = end(iter.next()) + 1;
-        long end = start(iter.next()) - 1;
-        return new Pair<Long, Long>(start, end);
+        return (getFirstGap(MIN_SEQNO));
     }
 
-    RangeSet<Long> getRanges() {
-        return m_map;
+    /**
+     * Find first gap after or including a sequence number if it exists
+     *
+     * @param afterSeqNo find first gap after (or including) this seqNo
+     * @return
+     */
+    public Pair<Long, Long> getFirstGap(long afterSeqNo) {
+        if (m_map.isEmpty()) {
+            return null;
+        }
+
+        // Handle corner cases
+        if (afterSeqNo < getFirstSeqNo()) {
+            // Initial gap
+            return new Pair<Long, Long>(MIN_SEQNO, getFirstSeqNo() - 1);
+        }
+        else if (getLastSeqNo() < afterSeqNo) {
+            // Trailing gap
+            return new Pair<Long, Long>(getLastSeqNo() + 1, INFINITE_SEQNO);
+        }
+        else if (size() < 2) {
+            // Only one segment
+            if (getLastSeqNo() < INFINITE_SEQNO) {
+                // Next gap will be trailing
+                return new Pair<Long, Long>(getLastSeqNo() + 1, INFINITE_SEQNO);
+            }
+            // No gaps
+            return null;
+        }
+
+        // Search for next gap
+        Iterator<Range<Long>> iter = m_map.asRanges().iterator();
+        Range<Long> current = iter.next();
+        assert current != null;
+
+        while (iter.hasNext()) {
+            Range<Long> next = iter.next();
+            long start = end(current) + 1;
+            long end = start(next) - 1;
+            if (end < afterSeqNo) {
+                current = next;
+                continue;
+            }
+            return new Pair<Long, Long>(start, end);
+        }
+        if (getLastSeqNo() < INFINITE_SEQNO) {
+            // Next gap will be trailing
+            return new Pair<Long, Long>(getLastSeqNo() + 1, INFINITE_SEQNO);
+        }
+        return null;
     }
 
     /**
@@ -335,5 +398,57 @@ public class ExportSequenceNumberTracker {
 
     public boolean isEmpty() {
         return m_map.isEmpty();
+    }
+
+    @Override
+    public void serialize(ByteBuffer buf) throws IOException {
+
+        // Entry count (int) + 2 Long per entry
+        if (isEmpty()) {
+            buf.putInt(0);
+        } else {
+            int trackSize = size();
+            buf.putInt(trackSize);
+
+            for (Range<Long> entry : m_map.asRanges()) {
+                buf.putLong(start(entry));
+                buf.putLong(end(entry));
+            }
+        }
+
+        // Sentinel (byte)
+        buf.put(m_hasSentinel ? (byte) 1 : (byte) 0);
+    }
+
+    @Override
+    public void cancel() {
+        // *void*
+    }
+
+    @Override
+    public int getSerializedSize() throws IOException {
+        int count = 0;
+
+        // Entry count (int) + 2 Long per entry
+        if (isEmpty()) {
+            count += 4;
+        } else {
+            count += 4;
+            count += 2 * 8 * size();
+        }
+
+        // Sentinel (byte)
+        return count + 1;
+    }
+
+    public ExportSequenceNumberTracker duplicate() {
+
+        ExportSequenceNumberTracker tracker = new ExportSequenceNumberTracker();
+
+        for (Range<Long> entry : m_map.asRanges()) {
+            tracker.append(start(entry), end(entry));
+        }
+        tracker.m_hasSentinel = m_hasSentinel;
+        return tracker;
     }
 }

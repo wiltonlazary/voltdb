@@ -24,6 +24,8 @@
 package org.voltdb.regressionsuites;
 
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Random;
 
 import org.voltdb.BackendTarget;
@@ -327,8 +329,8 @@ public class TestSystemProcedureSuite extends RegressionSuite {
                     "  NAME VARCHAR(32 BYTES) NOT NULL,\n" +
                     "  PRICE FLOAT," +
                     "  NONID INTEGER NOT NULL," +
-                    "  ID INTEGER ").append(internalExtras)
-            .append(");\n")
+                    "  ID INTEGER NOT NULL ").append(internalExtras)
+            .append(") USING TTL 10 SECONDS ON COLUMN ID;\n")
             .append(externalExtras);
         }
         //*enable to debug*/ System.out.println(schema.toString());
@@ -1005,6 +1007,16 @@ public class TestSystemProcedureSuite extends RegressionSuite {
         }
     }
 
+    public void testSwapTablesWithExport() throws Exception {
+        Client client = getClient();
+        try {
+            client.callProcedure("@SwapTables", "MIGRATE1", "MIGRATE2");
+            fail("Swap should not be allowed between migrate tables.");
+        } catch (ProcCallException ex) {
+            assertTrue(ex.getMessage().contains("exporting"));
+        }
+    }
+
     //
     // Build a list of the tests to be run. Use the regression suite
     // helpers to allow multiple backends.
@@ -1042,7 +1054,10 @@ public class TestSystemProcedureSuite extends RegressionSuite {
                 "CREATE TABLE PAUSE_TEST_TBL (\n" +
                 "  TEST_ID SMALLINT DEFAULT 0 NOT NULL\n" +
                 ");\n" +
-                "";
+                "CREATE table MIGRATE1 MIGRATE to TARGET FOO (" +
+                        "PKEY          INTEGER          NOT NULL);\n" +
+                "CREATE table MIGRATE2 MIGRATE to TARGET FOO (" +
+                        "PKEY          INTEGER          NOT NULL);\n";
         project.addLiteralSchema(literalSchema);
 
         // testSwapTables needs lots of variations on the same table,
@@ -1061,10 +1076,12 @@ public class TestSystemProcedureSuite extends RegressionSuite {
 
         MultiConfigSuiteBuilder builder =
                 new MultiConfigSuiteBuilder(TestSystemProcedureSuite.class);
-        LocalCluster config;
+        Map<String, String> additionalEnv = new HashMap<String, String>();
+        System.setProperty("TIME_TO_LIVE_DELAY", "60000");
+        additionalEnv.put("TIME_TO_LIVE_DELAY", "60000");
 
-        config = new LocalCluster("sysproc-cluster.jar", SITES, HOSTS, KFACTOR,
-               BackendTarget.NATIVE_EE_JNI);
+        LocalCluster config = new LocalCluster("sysproc-cluster.jar", SITES, HOSTS, KFACTOR,
+               BackendTarget.NATIVE_EE_JNI, additionalEnv);
         if ( ! hasLocalServer ) {
             config.setHasLocalServer(false);
         }

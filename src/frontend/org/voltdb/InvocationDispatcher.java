@@ -24,8 +24,8 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.Iterator;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Callable;
@@ -34,6 +34,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.zookeeper_voltpatches.KeeperException;
@@ -77,6 +78,7 @@ import org.voltdb.utils.VoltFile;
 import org.voltdb.utils.VoltTrace;
 
 import com.google_voltpatches.common.base.Throwables;
+import com.google_voltpatches.common.collect.ImmutableList;
 import com.google_voltpatches.common.collect.ImmutableMap;
 import com.google_voltpatches.common.util.concurrent.ListenableFuture;
 
@@ -123,11 +125,9 @@ public final class InvocationDispatcher {
     private final NTProcedureService m_NTProcedureService;
 
     // Next partition to service adhoc replicated table reads
-    private static int m_nextPartition = -1;
-    // Number of partitions, will NOT change when new node joins cluster
-    private static int m_partitionCount;
+    private static final AtomicInteger m_nextPartition = new AtomicInteger();
     // the partition id list, which does not assume starting from 0
-    private static ArrayList<Integer> m_partitionIds;
+    private static volatile List<Integer> m_partitionIds;
 
     public final static class Builder {
 
@@ -242,25 +242,12 @@ public final class InvocationDispatcher {
         m_NTProcedureService.update(m_catalogContext.get());
     }
 
-    LightweightNTClientResponseAdapter getInternelAdapterNT () {
+    public LightweightNTClientResponseAdapter getInternelAdapterNT () {
         return m_NTProcedureService.m_internalNTClientAdapter;
     }
 
-    static void updatePartitionInformation() {
-        m_partitionIds = new ArrayList<>();
-
-        VoltTable partitionKeys = TheHashinator.getPartitionKeys(VoltType.INTEGER);
-        ByteBuffer buf = ByteBuffer.allocate(partitionKeys.getSerializedSize());
-        partitionKeys.flattenToBuffer(buf);
-        buf.flip();
-        VoltTable keyCopy = PrivateVoltTableFactory.createVoltTableFromSharedBuffer(buf);
-        keyCopy.resetRowPosition();
-        while (keyCopy.advanceRow()) {
-            if (MpInitiator.MP_INIT_PID != keyCopy.getLong("PARTITION_ID")) {
-                m_partitionIds.add((int)(keyCopy.getLong("PARTITION_ID")));
-            }
-        }
-        m_partitionCount = m_partitionIds.size();
+    public static void updatePartitionInformation() {
+        m_partitionIds = ImmutableList.copyOf(TheHashinator.getCurrentHashinator().getPartitions());
     }
 
     /*
@@ -381,8 +368,33 @@ public final class InvocationDispatcher {
         }
 
         // check for allPartition invocation and provide a nice error if it's misused
-        if (task.getAllPartition()) {
+        if (task.hasPartitionDestination()) {
+            if (!catProc.getSinglepartition()
+                    || (catProc.getPartitionparameter() != 0 && catProc.getPartitionparameter() != -1)
+                    || catProc.getSystemproc()) {
+                return new ClientResponseImpl(ClientResponseImpl.GRACEFUL_FAILURE, new VoltTable[0],
+                        "Invalid procedure for all-partition execution. "
+                                + "Targeted procedure must be partitioned on the first parameter "
+                                + "or be a directed procedure, "
+                                + "and must not be a system procedure.",
+                        task.clientHandle);
+            }
+
+            if (task.getPartitionDestination() < 0 || task.getPartitionDestination() >= MpInitiator.MP_INIT_PID) {
+                return new ClientResponseImpl(ClientResponseImpl.GRACEFUL_FAILURE, new VoltTable[0],
+                        "Invalid destination partition provided: " + task.getPartitionDestination(),
+                        task.clientHandle);
+            }
+
+            if (catProc.getPartitionparameter() == -1
+                    && task.getParams().size() == catProc.getParameters().size() + 1) {
+                // Client provided a partition parameter for backwards compatibility so strip off the first parameter
+                Object[] params = task.getParams().toArray();
+                task.setParams(Arrays.copyOfRange(params, 1, params.length));
+            }
+        } else if (task.getAllPartition()) {
             // must be single partition and must be partitioned on parameter 0
+            // TODO could add support for calling a procedure without a partition parameter
             if (!catProc.getSinglepartition() || (catProc.getPartitionparameter() != 0) || catProc.getSystemproc()) {
                 return new ClientResponseImpl(ClientResponseImpl.GRACEFUL_FAILURE,
                         new VoltTable[0], "Invalid procedure for all-partition execution. " +
@@ -390,6 +402,12 @@ public final class InvocationDispatcher {
                                  "and must not be a system procedure.",
                         task.clientHandle);
             }
+        } else if (catProc.getSinglepartition() && catProc.getPartitionparameter() == -1) {
+            return new ClientResponseImpl(ClientResponseImpl.GRACEFUL_FAILURE, new VoltTable[0],
+                    "Procedure " + catProc.getTypeName()
+                            + " is a work procedure and needs to be invoked appropriately. "
+                            + "The Client.callAllPartitionProcedure method should be used.",
+                    task.clientHandle);
         }
 
         if (catProc.getSystemproc()) {
@@ -485,7 +503,8 @@ public final class InvocationDispatcher {
             // admin port, otherwise return a failure
             if (    "@Pause".equals(procName)
                  || "@Resume".equals(procName)
-                 || "@PrepareShutdown".equals(procName))
+                 || "@PrepareShutdown".equals(procName)
+                 || "@CancelShutdown".equals(procName))
             {
                 if (handler.isAdmin() == false) {
                     return unexpectedFailureResponse(
@@ -500,38 +519,59 @@ public final class InvocationDispatcher {
         // up above.  -rtb.
 
         int[] partitions = null;
-        try {
-            partitions = getPartitionsForProcedure(catProc, task);
-        } catch (Exception e) {
-            // unable to hash to a site, return an error
-            return getMispartitionedErrorResponse(task, catProc, e);
-        }
-        boolean success = createTransaction(handler.connectionId(),
-                        task,
-                        catProc.getReadonly(),
-                        catProc.getSinglepartition(),
-                        catProc.getEverysite(),
-                        partitions,
-                        task.getSerializedSize(),
-                        nowNanos);
-        if (!success) {
-            // when VoltDB.crash... is called, we close off the client interface
-            // and it might not be possible to create new transactions.
-            // Return an error.
-            return new ClientResponseImpl(ClientResponseImpl.SERVER_UNAVAILABLE,
-                    new VoltTable[0],
-                    "VoltDB failed to create the transaction internally.  It is possible this "
-                    + "was caused by a node failure or intentional shutdown. If the cluster recovers, "
-                    + "it should be safe to resend the work, as the work was never started.",
-                    task.clientHandle);
-        }
+        do {
+            try {
+                partitions = getPartitionsForProcedure(catProc, task);
+                if (partitions == null) {
+                    return new ClientResponseImpl(ClientResponseImpl.GRACEFUL_FAILURE, new VoltTable[0],
+                            "Partition does not exist: " + task.getPartitionDestination(), task.clientHandle);
+                }
+            } catch (Exception e) {
+                // unable to hash to a site, return an error
+                return getMispartitionedErrorResponse(task, catProc, e);
+            }
 
-        return null;
+            try {
+                // getPartitionsForProcedure and the directed procedure handling can modify the parameters
+                task = MiscUtils.roundTripForCL(task);
+            } catch (IOException e) {
+                return new ClientResponseImpl(ClientResponseImpl.GRACEFUL_FAILURE, new VoltTable[0],
+                        "Unable to execute " + task.getProcName() + " with parameters " + task.getParams());
+            }
+
+            CreateTransactionResult result = createTransaction(handler.connectionId(), task, catProc.getReadonly(),
+                    catProc.getSinglepartition(), catProc.getEverysite(), partitions, task.getSerializedSize(),
+                    nowNanos);
+            switch (result) {
+            case SUCCESS:
+                return null;
+            case NO_CLIENT_HANDLER:
+                /*
+                 * when VoltDB.crash... is called, we close off the client interface and it might not be possible to
+                 * create new transactions. Return an error. Another case is when elastic shrink, the target partition
+                 * may be removed in between the transaction is created
+                 */
+                return new ClientResponseImpl(ClientResponseImpl.SERVER_UNAVAILABLE, new VoltTable[0],
+                        "VoltDB failed to create the transaction internally.  It is possible this "
+                                + "was caused by a node failure or intentional shutdown. If the cluster recovers, "
+                                + "it should be safe to resend the work, as the work was never started.",
+                        task.clientHandle);
+            case PARTITION_REMOVED:
+                if (task.hasPartitionDestination()) {
+                    return new ClientResponseImpl(ClientResponseImpl.GRACEFUL_FAILURE, new VoltTable[0],
+                            "Partition does not exist: " + task.getPartitionDestination(), task.clientHandle);
+                }
+                // Loop back around and try to figure out the partitions again
+                Thread.yield();
+            }
+        } while (true);
     }
 
     private final boolean shouldLoadSchemaFromSnapshot() {
         CatalogMap<Table> tables = m_catalogContext.get().database.getTables();
-        if(tables.size() == 0) return true;
+        if(tables.size() == 0) {
+            return true;
+        }
         for(Table t : tables) {
             if(!t.getSignature().startsWith("VOLTDB_AUTOGEN_XDCR")) {
                 return false;
@@ -541,9 +581,14 @@ public final class InvocationDispatcher {
     }
 
     public final static Procedure getProcedureFromName(String procName, CatalogContext catalogContext) {
-        Procedure catProc = catalogContext.procedures.get(procName);
+        return getProcedureFromName(procName, catalogContext.procedures, catalogContext.m_defaultProcs);
+    }
+
+    public final static Procedure getProcedureFromName(String procName, CatalogMap<Procedure> procedures,
+            DefaultProcedureManager defaultProcs) {
+        Procedure catProc = procedures.get(procName);
         if (catProc == null) {
-            catProc = catalogContext.m_defaultProcs.checkForDefaultProcedure(procName);
+            catProc = defaultProcs.checkForDefaultProcedure(procName);
         }
 
         if (catProc == null) {
@@ -571,7 +616,9 @@ public final class InvocationDispatcher {
         }
 
         if (voltdb.isPreparingShuttingdown()) {
-            if (procedure.getAllowedinshutdown()) return null;
+            if (procedure.getAllowedinshutdown()) {
+                return null;
+            }
 
             return serverUnavailableResponse(
                     SHUTDOWN_MSG,
@@ -790,8 +837,8 @@ public final class InvocationDispatcher {
 
            // shutdown partition leader migration
            MigratePartitionLeaderMessage message = new MigratePartitionLeaderMessage(ihid, Integer.MIN_VALUE);
-           for (Iterator<Integer> it = liveHids.iterator(); it.hasNext();) {
-               m_mailbox.send(CoreUtils.getHSIdFromHostAndSite(it.next(),
+           for (Integer integer : liveHids) {
+               m_mailbox.send(CoreUtils.getHSIdFromHostAndSite(integer,
                            HostMessenger.CLIENT_INTERFACE_SITE_ID), message);
            }
 
@@ -874,6 +921,7 @@ public final class InvocationDispatcher {
         spi.setBatchTimeout(task.getBatchTimeout());
         spi.type = task.getType();
         spi.setAllPartition(task.getAllPartition());
+        spi.setPartitionDestination(task.getPartitionDestination());
         return spi;
     }
 
@@ -882,19 +930,23 @@ public final class InvocationDispatcher {
      * @param txnId
      * @param partitionId
      */
-    public final void sendSentinel(long txnId, int partitionId) {
-        final long initiatorHSId = m_cartographer.getHSIdForSinglePartitionMaster(partitionId);
-        sendSentinel(txnId, initiatorHSId, -1, -1, true);
+    public final void sendSentinel(long uniqueId, int partitionId) {
+        final Long initiatorHSId = m_cartographer.getHSIdForSinglePartitionMaster(partitionId);
+        if (initiatorHSId == null) {
+            log.error("InvocationDispatcher.sendSentinel: Master does not exist for partition: " + partitionId);
+        } else {
+            sendSentinel(uniqueId, initiatorHSId, -1, -1, true);
+        }
     }
 
-    private final void sendSentinel(long txnId, long initiatorHSId, long ciHandle,
+    private final void sendSentinel(long uniqueId, long initiatorHSId, long ciHandle,
                               long connectionId, boolean forReplay) {
         //The only field that is relevant is txnid, and forReplay.
         MultiPartitionParticipantMessage mppm =
                 new MultiPartitionParticipantMessage(
                         m_siteId,
                         initiatorHSId,
-                        txnId,
+                        uniqueId,
                         ciHandle,
                         connectionId,
                         false,  // isReadOnly
@@ -1174,10 +1226,15 @@ public final class InvocationDispatcher {
             try {
                 catalog = MiscUtils.fileToBytes(catalogFH);
             } catch (IOException e) {
-                log.warn("Unable to access file " + catalogFH, e);
+                HostMessenger hm = VoltDB.instance().getHostMessenger();
+                log.warn("Unable to access schema and procedure file " + catalogFH + " on " + hm.getHostname() +
+                        ", if you believe the path is correct, please retry the command on other hosts, this file" +
+                        " may has redundant copies elsewhere.");
+                log.info("Stacktrace: ", e);
                 return unexpectedFailureResponse(
-                        "Unable to access file " + catalogFH,
-                        task.clientHandle);
+                        "Unable to access schema and procedure file " + catalogFH + " on " + hm.getHostname() +
+                        ", if you believe the path is correct, please retry the command on other hosts, this file" +
+                        " may has redundant copies elsewhere.", task.clientHandle);
             }
             final String dep = new String(catalogContext.getDeploymentBytes(), StandardCharsets.UTF_8);
 
@@ -1265,7 +1322,7 @@ public final class InvocationDispatcher {
     }
 
     // Wrap API to SimpleDtxnInitiator - mostly for the future
-    public boolean createTransaction(
+    public CreateTransactionResult createTransaction(
             final long connectionId,
             final StoredProcedureInvocation invocation,
             final boolean isReadOnly,
@@ -1290,7 +1347,7 @@ public final class InvocationDispatcher {
     }
 
     // Wrap API to SimpleDtxnInitiator - mostly for the future
-    public  boolean createTransaction(
+    public CreateTransactionResult createTransaction(
             final long connectionId,
             final long txnId,
             final long uniqueId,
@@ -1310,7 +1367,7 @@ public final class InvocationDispatcher {
                     "InvocationDispatcher.createTransaction request rejected. "
                     + "This is likely due to VoltDB ceasing client communication as it "
                     + "shuts down.");
-            return false;
+            return CreateTransactionResult.NO_CLIENT_HANDLER;
         }
 
         Long initiatorHSId = null;
@@ -1330,6 +1387,17 @@ public final class InvocationDispatcher {
             if (isReadOnly) {
                 isShortCircuitRead = true;
             }
+        }
+
+        if (initiatorHSId == null) {
+            hostLog.rateLimitedLog(60, Level.INFO, null,
+                    String.format(
+                            "InvocationDispatcher.createTransaction request rejected for partition %d invocation %s."
+                                    + " isReadOnly=%s isSinglePartition=%s, isEveryPartition=%s isForReplay=%s."
+                                    + " This is likely due to partition leader being removed during elastic shrink.",
+                            (isSinglePartition && !isEveryPartition) ? partitions[0] : 16383, invocation, isReadOnly,
+                            isSinglePartition, isEveryPartition, isForReplay));
+            return CreateTransactionResult.PARTITION_REMOVED;
         }
 
         long handle = cihm.getHandle(isSinglePartition, isSinglePartition ? partitions[0] : -1, invocation.getClientHandle(),
@@ -1362,15 +1430,31 @@ public final class InvocationDispatcher {
 
         Iv2Trace.logCreateTransaction(workRequest);
         m_mailbox.send(initiatorHSId, workRequest);
-        return true;
+        return CreateTransactionResult.SUCCESS;
     }
 
+    /**
+     * @param procedure Which will be executed
+     * @param task      Describing how to execute the procedure
+     * @return the array of partitions {@code task} should target or {@code null} if a destination is provided that does
+     *         not exist
+     */
     final static int[] getPartitionsForProcedure(Procedure procedure, StoredProcedureInvocation task) {
         final CatalogContext.ProcedurePartitionInfo ppi =
                 (CatalogContext.ProcedurePartitionInfo) procedure.getAttachment();
         if (procedure.getSinglepartition()) {
+            if (procedure.getPartitionparameter() == -1) {
+                if (task.hasPartitionDestination()) {
+                    return new int[] { task.getPartitionDestination() };
+                } else {
+                    throw new RuntimeException("Procedure " + procedure.getTypeName()
+                            + " is a directed procedure and needs to invoked appropriately. "
+                            + "The Client.callAllPartitionProcedure method should be used.");
+                }
+            }
             // break out the Hashinator and calculate the appropriate partition
             Object invocationParameter = task.getParameterAtIndex(ppi.index);
+
             if (invocationParameter == null && procedure.getReadonly()) {
                 // AdHoc replicated table reads are optimized as single partition,
                 // but without partition params, since replicated table reads can
@@ -1378,11 +1462,48 @@ public final class InvocationDispatcher {
                 // partitions to spread the traffic.
                 assert (task.getProcName().equals("@AdHoc_RO_SP")): task.getProcName();
 
-                int partitionIdIndex = (Math.abs(++m_nextPartition)) % m_partitionCount;
-                int partitionId = m_partitionIds.get(partitionIdIndex);
+                List<Integer> partitionIds = m_partitionIds;
+                int partitionIdIndex = Math.abs(m_nextPartition.getAndIncrement()) % partitionIds.size();
+                int partitionId = partitionIds.get(partitionIdIndex);
                 return new int[] {partitionId};
             }
-            return new int[] { TheHashinator.getPartitionForParameter(ppi.type, invocationParameter) };
+            int hashedPartitionId = TheHashinator.getPartitionForParameter(ppi.type, invocationParameter);
+
+            if (task.hasPartitionDestination() && hashedPartitionId != task.getPartitionDestination()) {
+                // Client sent a destination partition but that doesn't align with the partition parameter so force it
+                hashedPartitionId = task.getPartitionDestination();
+
+                // Find a parameter which should go to the destination partition
+                VoltType type = VoltType.typeFromObject(invocationParameter);
+                VoltTable origTable = TheHashinator.getPartitionKeys(type);
+                VoltTable copyTable = PrivateVoltTableFactory.createVoltTableFromBuffer(origTable.getBuffer(), true);
+
+                Object newParameter = null;
+                copyTable.resetRowPosition();
+                while (copyTable.advanceRow()) {
+                    if (hashedPartitionId == copyTable.getLong(0)) {
+                        newParameter = copyTable.get(1, type);
+                        break;
+                    }
+                }
+
+                if (newParameter == null) {
+                    return null;
+                }
+
+                if (log.isDebugEnabled()) {
+                    log.debug("Hashed partition, " + hashedPartitionId + ", does not match destination, "
+                            + task.getPartitionDestination() + " Updating partition paramter from ("
+                            + invocationParameter + ") to (" + newParameter + ')');
+                }
+
+                // Update parameters
+                Object[] updatedParams = task.getParams().toArray();
+                updatedParams[ppi.index] = newParameter;
+                task.setParams(updatedParams);
+            }
+
+            return new int[] { hashedPartitionId };
         } else if (procedure.getPartitioncolumn2() != null) {
             // two-partition procedure
             VoltType partitionParamType1 = VoltType.get((byte)procedure.getPartitioncolumn().getType());

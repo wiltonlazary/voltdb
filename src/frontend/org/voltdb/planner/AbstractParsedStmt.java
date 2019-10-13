@@ -27,7 +27,6 @@ import java.util.Map.Entry;
 import java.util.Set;
 import java.util.TreeMap;
 
-import org.hsqldb_voltpatches.FunctionForVoltDB;
 import org.hsqldb_voltpatches.VoltXMLElement;
 import org.json_voltpatches.JSONException;
 import org.voltdb.VoltType;
@@ -38,6 +37,7 @@ import org.voltdb.catalog.Constraint;
 import org.voltdb.catalog.Database;
 import org.voltdb.catalog.Index;
 import org.voltdb.catalog.Table;
+import org.voltdb.exceptions.PlanningErrorException;
 import org.voltdb.expressions.AbstractExpression;
 import org.voltdb.expressions.AggregateExpression;
 import org.voltdb.expressions.ComparisonExpression;
@@ -402,7 +402,7 @@ public abstract class AbstractParsedStmt {
 
         XMLElementExpressionParser parser = m_exprParsers.get(elementName);
         if (parser == null) {
-            throw new PlanningErrorException("Unsupported expression node '" + elementName + "'");
+            throw new PlanningErrorException("Unsupported expression node '" + elementName + "'", 0);
         }
         AbstractExpression retval = parser.parse(this, exprNode);
         assert("asterisk".equals(elementName) || retval != null);
@@ -919,7 +919,7 @@ public abstract class AbstractParsedStmt {
     private AbstractExpression parseOperationExpression(VoltXMLElement exprNode) {
         String optype = exprNode.attributes.get("optype");
         ExpressionType exprType = ExpressionType.get(optype);
-        AbstractExpression expr = null;
+        AbstractExpression expr;
 
         if (exprType == ExpressionType.INVALID) {
             throw new PlanningErrorException("Unsupported operation type '" + optype + "'");
@@ -957,14 +957,6 @@ public abstract class AbstractParsedStmt {
         // a constant/tuple/param value operand).
         AbstractExpression leftExpr = parseExpressionNode(leftExprNode);
         assert((leftExpr != null) || (exprType == ExpressionType.AGGREGATE_COUNT));
-        // Forbid user from creating filter like NOT NOT_MIGRATED(), because this will give
-        // wrong results, due to how the partial index of MIGRATING index is created.
-        // This, however, does not do more thorough check on more complex expressions.
-        if (exprType == ExpressionType.OPERATOR_NOT && leftExpr instanceof FunctionExpression &&
-                ((FunctionExpression) leftExpr).hasFunctionId(
-                        FunctionForVoltDB.FunctionDescriptor.FUNC_VOLT_NOT_MIGRATED)) {
-            throw new PlanningErrorException("\"NOT NOT_MIGRATED()\" is an invalid predicate.");
-        }
         expr.setLeft(leftExpr);
 
         // get the second (right) node that is an element (might be null)
@@ -1223,6 +1215,9 @@ public abstract class AbstractParsedStmt {
 
     private AbstractExpression parseAggregationExpression(VoltXMLElement exprNode) {
         String type = exprNode.attributes.get("optype");
+        String tempId = exprNode.attributes.get("user_aggregate_id");
+        int userAggregateId = tempId == null ? -1 : Integer.parseInt(tempId);
+        String functionName = exprNode.attributes.get("name");
         ExpressionType exprType = ExpressionType.get(type);
 
         if (exprType == ExpressionType.INVALID) {
@@ -1247,7 +1242,7 @@ public abstract class AbstractParsedStmt {
             exprType = ExpressionType.AGGREGATE_COUNT_STAR;
         }
 
-        AggregateExpression expr = new AggregateExpression(exprType);
+        AggregateExpression expr = new AggregateExpression(exprType, userAggregateId, functionName);
         expr.setLeft(childExpr);
 
         String node;
@@ -2390,10 +2385,17 @@ public abstract class AbstractParsedStmt {
     public Collection<String> calculateUDFDependees() {
         List<String> answer = new ArrayList<>();
         Collection<AbstractExpression> fCalls = findAllSubexpressionsOfClass(FunctionExpression.class);
+        Collection<AbstractExpression> aCalls = findAllSubexpressionsOfClass(AggregateExpression.class);
         for (AbstractExpression fCall : fCalls) {
             FunctionExpression fexpr = (FunctionExpression)fCall;
             if (fexpr.isUserDefined()) {
                 answer.add(fexpr.getFunctionName());
+            }
+        }
+        for (AbstractExpression aCall : aCalls) {
+            AggregateExpression aexpr = (AggregateExpression)aCall;
+            if (aexpr.isUserDefined()) {
+                answer.add(aexpr.getFunctionName());
             }
         }
         return answer;

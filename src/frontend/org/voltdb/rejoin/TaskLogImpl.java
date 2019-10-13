@@ -43,8 +43,8 @@ public class TaskLogImpl implements TaskLog {
             Long.parseLong(System.getProperty("REJOIN_OVERFLOW_LIMIT", "102400"));
 
     private final int m_partitionId;
-    private final BinaryDeque m_buffers;
-    private final BinaryDequeReader m_reader;
+    private final BinaryDeque<?> m_buffers;
+    private final BinaryDequeReader<?> m_reader;
     private RejoinTaskBuffer m_tail = null;
     private RejoinTaskBuffer m_head = null;
     //Not using as a bounded queue
@@ -78,8 +78,8 @@ public class TaskLogImpl implements TaskLog {
 
         m_partitionId = partitionId;
         m_cursorId = "TaskLog-" + partitionId;
-        m_buffers = new PersistentBinaryDeque(
-                Integer.toString(partitionId), null, overflowDir, new VoltLogger("REJOIN"));
+        m_buffers = PersistentBinaryDeque.builder(Integer.toString(partitionId), overflowDir, new VoltLogger("REJOIN"))
+                .build();
         m_reader = m_buffers.openForRead(m_cursorId);
         m_es = CoreUtils.getSingleThreadExecutor("TaskLog partition " + partitionId);
     }
@@ -131,8 +131,12 @@ public class TaskLogImpl implements TaskLog {
 
     @Override
     public void logTask(TransactionInfoBaseMessage message) throws IOException {
-        if (message.getSpHandle() <= m_snapshotSpHandle) return;
-        if (m_closed) throw new IOException("Closed");
+        if (message.getSpHandle() <= m_snapshotSpHandle) {
+            return;
+        }
+        if (m_closed) {
+            throw new IOException("Closed");
+        }
 
         assert(message != null);
         bufferCatchup(message.getSerializedSize());
@@ -166,14 +170,16 @@ public class TaskLogImpl implements TaskLog {
      */
     @Override
     public TransactionInfoBaseMessage getNextMessage() throws IOException {
-        if (m_closed) throw new IOException("Closed");
+        if (m_closed) {
+            throw new IOException("Closed");
+        }
         if (m_head == null) {
             // Get another buffer asynchronously
             final Runnable r = new Runnable() {
                 @Override
                 public void run() {
                     try {
-                        BBContainer cont = m_reader.poll(PersistentBinaryDeque.UNSAFE_CONTAINER_FACTORY, false);
+                        BBContainer cont = m_reader.poll(PersistentBinaryDeque.UNSAFE_CONTAINER_FACTORY);
                         if (cont != null) {
                            m_headBuffers.offer(new RejoinTaskBuffer(cont));
                         }
@@ -241,7 +247,9 @@ public class TaskLogImpl implements TaskLog {
 
     private boolean m_closed = false;
     public void close(boolean synchronous) throws IOException {
-        if (m_closed) return;
+        if (m_closed) {
+            return;
+        }
         m_closed = true;
         m_es.shutdown();
         if (synchronous) {

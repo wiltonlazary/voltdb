@@ -124,6 +124,7 @@ function async-benchmark() {
         --progresstimeout=20 \
         --usecompression=false \
         --allowinprocadhoc=false
+        # --enabledthreads=partttlMigratelt,replttlMigratelt
         # --disabledthreads=ddlt,partBiglt,replBiglt,partCappedlt,replCappedlt,replLoadlt,partLoadlt,adHocMayhemThread,idpt,partTrunclt,replTrunclt
 #ddlt,clients,partBiglt,replBiglt,partCappedlt,replCappedlt,replLoadlt,partLoadlt,adHocMayhemThread,idpt,readThread,partTrunclt,replTrunclt
         # --sslfile=./keystore.props
@@ -131,7 +132,7 @@ function async-benchmark() {
 
 function init() {
     jars-ifneeded
-    sqlcmd < src/txnIdSelfCheck/ddl-nocat.sql
+    sqlcmd < src/txnIdSelfCheck/ddl.sql
 }
 
 function help() {

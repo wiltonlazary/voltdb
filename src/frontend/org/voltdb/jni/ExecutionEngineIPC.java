@@ -17,8 +17,11 @@
 
 package org.voltdb.jni;
 
+import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
+import java.io.ObjectOutput;
+import java.io.ObjectOutputStream;
 import java.io.UnsupportedEncodingException;
 import java.lang.reflect.InvocationTargetException;
 import java.net.InetSocketAddress;
@@ -34,11 +37,14 @@ import org.voltcore.utils.Pair;
 import org.voltdb.BackendTarget;
 import org.voltdb.ParameterSet;
 import org.voltdb.PrivateVoltTableFactory;
+import org.voltdb.SnapshotCompletionMonitor.ExportSnapshotTuple;
 import org.voltdb.StatsSelector;
 import org.voltdb.TableStreamType;
 import org.voltdb.TheHashinator.HashinatorConfig;
-import org.voltdb.UserDefinedFunctionManager.UserDefinedFunctionRunner;
+import org.voltdb.UserDefinedAggregateFunctionRunner;
+import org.voltdb.UserDefinedScalarFunctionRunner;
 import org.voltdb.VoltTable;
+import org.voltdb.VoltType;
 import org.voltdb.common.Constants;
 import org.voltdb.exceptions.EEException;
 import org.voltdb.exceptions.SerializableException;
@@ -46,12 +52,12 @@ import org.voltdb.export.ExportManager;
 import org.voltdb.iv2.DeterminismHash;
 import org.voltdb.messaging.FastDeserializer;
 import org.voltdb.messaging.FastSerializer;
+import org.voltdb.sysprocs.saverestore.HiddenColumnFilter;
 import org.voltdb.sysprocs.saverestore.SnapshotUtil;
 import org.voltdb.utils.CompressionService;
 import org.voltdb.utils.SerializationHelper;
 
 import com.google_voltpatches.common.base.Charsets;
-import com.google_voltpatches.common.base.Throwables;
 
 /* Serializes data over a connection that presumably is being read
  * by a voltdb execution engine. The serialization is currently a
@@ -132,7 +138,10 @@ public class ExecutionEngineIPC extends ExecutionEngine {
         , ExecuteTask(28)
         , ApplyBinaryLog(29)
         , ShutDown(30)
-        , SetViewsEnabled(31);
+        , SetViewsEnabled(31)
+        , DeleteMigratedRows(32)
+        , DisableExternalStreams(33)
+        , ExternalStreamsEnabled(34);
 
         Commands(final int id) {
             m_id = id;
@@ -273,10 +282,34 @@ public class ExecutionEngineIPC extends ExecutionEngine {
         static final int kErrorCode_callJavaUserDefinedFunction = 107;
 
         /**
-         * An error code that can be sent at any time indicating that
-         * an export stream is dropped
+         * An error code that can be sent at any time indicating that an export stream is dropped
          */
         static final int kErrorCode_pushEndOfStream = 113;
+
+        /**
+         * Instruct the Java side to start a user-defined aggregate function.
+         */
+        static final int kErrorCode_callJavaUserDefinedAggregateStart = 114;
+
+        /**
+         * Instruct the Java side to assemble a user-defined aggregate function.
+         */
+        static final int kErrorCode_callJavaUserDefinedAggregateAssemble = 115;
+
+        /**
+         * Instruct the Java side to combine a result from another user-defined aggregate with this one.
+         */
+        static final int kErrorCode_callJavaUserDefinedAggregateCombine = 116;
+
+        /**
+         * Instruct the Java side to complete the worker portion of a user-defined aggregate function.
+         */
+        static final int kErrorCode_callJavaUserDefinedAggregateWorkerEnd = 117;
+
+        /**
+         * Instruct the Java side to calculate the result of a user-defined aggregate function.
+         */
+        static final int kErrorCode_callJavaUserDefinedAggregateCoordinatorEnd = 118;
 
         ByteBuffer getBytes(int size) throws IOException {
             ByteBuffer header = ByteBuffer.allocate(size);
@@ -290,18 +323,24 @@ public class ExecutionEngineIPC extends ExecutionEngine {
             return header;
         }
 
+        private ByteBuffer readMessage() throws IOException {
+            int bufferSize = m_connection.readInt();
+            final ByteBuffer buffer = ByteBuffer.allocate(bufferSize);
+            while (buffer.hasRemaining()) {
+                int read = m_socketChannel.read(buffer);
+                if (read == -1) {
+                    throw new EOFException();
+                }
+            }
+            buffer.flip();
+            return buffer;
+        }
+
         // Read per-fragment stats from the wire.
         void extractPerFragmentStatsInternal() {
             try {
-                int bufferSize = m_connection.readInt();
-                final ByteBuffer perFragmentStatsBuffer = ByteBuffer.allocate(bufferSize);
-                while (perFragmentStatsBuffer.hasRemaining()) {
-                    int read = m_socketChannel.read(perFragmentStatsBuffer);
-                    if (read == -1) {
-                        throw new EOFException();
-                    }
-                }
-                perFragmentStatsBuffer.flip();
+                final ByteBuffer perFragmentStatsBuffer = readMessage();
+
                 // Skip the perFragmentTimingEnabled flag.
                 perFragmentStatsBuffer.get();
                 m_succeededFragmentsCount = perFragmentStatsBuffer.getInt();
@@ -324,18 +363,10 @@ public class ExecutionEngineIPC extends ExecutionEngine {
         void callJavaUserDefinedFunctionInternal() {
             try {
                 // Read the request content from the wire.
-                int bufferSize = m_connection.readInt();
-                final ByteBuffer udfBuffer = ByteBuffer.allocate(bufferSize);
-                while (udfBuffer.hasRemaining()) {
-                    int read = m_socketChannel.read(udfBuffer);
-                    if (read == -1) {
-                        throw new EOFException();
-                    }
-                }
-                udfBuffer.flip();
+                ByteBuffer udfBuffer = readMessage();
 
                 int functionId = udfBuffer.getInt();
-                UserDefinedFunctionRunner udfRunner = m_functionManager.getFunctionRunnerById(functionId);
+                UserDefinedScalarFunctionRunner udfRunner = m_functionManager.getFunctionRunnerById(functionId);
                 assert(udfRunner != null);
                 Throwable throwable = null;
                 Object returnValue = null;
@@ -346,7 +377,7 @@ public class ExecutionEngineIPC extends ExecutionEngine {
                     // Put the status code for success (zero) into the buffer.
                     m_data.putInt(0);
                     // Write the result to the buffer.
-                    UserDefinedFunctionRunner.writeValueToBuffer(m_data, udfRunner.getReturnType(), returnValue);
+                    UserDefinedScalarFunctionRunner.writeValueToBuffer(m_data, udfRunner.getReturnType(), returnValue);
                     m_data.flip();
                     m_connection.write();
                     return;
@@ -371,6 +402,85 @@ public class ExecutionEngineIPC extends ExecutionEngine {
                 m_connection.write();
             }
             catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+
+        void callJavaUserDefinedAggregateFunction(int operationId) {
+            try {
+                // Read the request content from the wire.
+                ByteBuffer udafBuffer = readMessage();
+
+                int functionId = udafBuffer.getInt();
+                UserDefinedAggregateFunctionRunner udafRunner = m_functionManager
+                        .getAggregateFunctionRunnerById(functionId);
+                assert (udafRunner != null);
+
+                Throwable throwable = null;
+                try {
+                    m_data.clear();
+                    // Put the status code for success (zero) into the buffer.
+                    m_data.putInt(0);
+
+                    if (operationId == kErrorCode_callJavaUserDefinedAggregateStart) {
+                        udafRunner.start();
+                    } else {
+                        int udafIndex = udafBuffer.getInt();
+
+                        switch (operationId) {
+                        case kErrorCode_callJavaUserDefinedAggregateAssemble:
+                            udafRunner.assemble(udafBuffer, udafIndex);
+                            break;
+                        case kErrorCode_callJavaUserDefinedAggregateCombine:
+                            udafRunner.combine(UserDefinedAggregateFunctionRunner.readObject(udafBuffer), udafIndex);
+                            break;
+                        case kErrorCode_callJavaUserDefinedAggregateWorkerEnd:
+                            Object workerInstance = udafRunner.getFunctionInstance(udafIndex);
+
+                            udafRunner.clearFunctionInstance(udafIndex);
+
+                            try (ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                                    ObjectOutput out = new ObjectOutputStream(bos)) {
+                                out.writeObject(workerInstance);
+                                out.flush();
+
+                                UserDefinedScalarFunctionRunner.writeValueToBuffer(m_data, VoltType.VARBINARY,
+                                        bos.toByteArray());
+                            }
+                            break;
+                        case kErrorCode_callJavaUserDefinedAggregateCoordinatorEnd:
+                            Object returnValue = udafRunner.end(udafIndex);
+                            UserDefinedScalarFunctionRunner.writeValueToBuffer(m_data, udafRunner.getReturnType(),
+                                    returnValue);
+                            break;
+                        default:
+                            throw new IllegalArgumentException("Unknown operation: " + operationId);
+                        }
+                    }
+
+                    // Write the result to the buffer.
+
+                    m_data.flip();
+                    m_connection.write();
+                    return;
+                } catch (InvocationTargetException ex1) {
+                    // Exceptions thrown during Java reflection will be wrapped into this InvocationTargetException.
+                    // We need to get its cause and throw that to the user.
+                    throwable = ex1.getCause();
+                } catch (Throwable ex2) {
+                    throwable = ex2;
+                }
+
+                // Getting here means the execution was not successful.
+                m_data.clear();
+
+                // Exception thrown, put return code = -1.
+                m_data.putInt(-1);
+                byte[] errorMsg = throwable.toString().getBytes(Constants.UTF8ENCODING);
+                SerializationHelper.writeVarbinary(errorMsg, m_data);
+                m_data.flip();
+                m_connection.write();
+            } catch (IOException e) {
                 throw new RuntimeException(e);
             }
         }
@@ -429,7 +539,6 @@ public class ExecutionEngineIPC extends ExecutionEngine {
                     // start sequence number - 8 bytes
                     // tupleCount - 8 bytes
                     // uniqueId - 8 bytes
-                    // sync - 1 byte
                     // export buffer length - 4 bytes
                     // export buffer - export buffer length bytes
                     int partitionId = getBytes(4).getInt();
@@ -438,21 +547,19 @@ public class ExecutionEngineIPC extends ExecutionEngine {
                     getBytes(signatureLength).get(signatureBytes);
                     String signature = new String(signatureBytes, "UTF-8");
                     long startSequenceNumber = getBytes(8).getLong();
+                    long committedSequenceNumber = getBytes(8).getLong();
                     long tupleCount = getBytes(8).getLong();
                     long uniqueId = getBytes(8).getLong();
-                    boolean sync = getBytes(1).get() == 1 ? true : false;
-                    long genId = getBytes(8).getLong();
                     int length = getBytes(4).getInt();
                     ExportManager.pushExportBuffer(
                             partitionId,
                             signature,
                             startSequenceNumber,
+                            committedSequenceNumber,
                             tupleCount,
                             uniqueId,
-                            genId,
                             0,
-                            length == 0 ? null : getBytes(length),
-                            sync);
+                            length == 0 ? null : getBytes(length));
                 }
                 else if (status == kErrorCode_pushEndOfStream) {
                     ByteBuffer header = ByteBuffer.allocate(8);
@@ -537,6 +644,9 @@ public class ExecutionEngineIPC extends ExecutionEngine {
                 }
                 else if (status == kErrorCode_callJavaUserDefinedFunction) {
                     callJavaUserDefinedFunctionInternal();
+                } else if (status >= kErrorCode_callJavaUserDefinedAggregateStart
+                        && status <= kErrorCode_callJavaUserDefinedAggregateCoordinatorEnd) {
+                    callJavaUserDefinedAggregateFunction(status);
                 }
                 else {
                     break;
@@ -827,8 +937,7 @@ public class ExecutionEngineIPC extends ExecutionEngine {
             final BackendTarget target,
             final int port,
             final HashinatorConfig hashinatorConfig,
-            final boolean isLowestSiteId,
-            final long exportFlushTimeout) {
+            final boolean isLowestSiteId) {
         super(siteId, partitionId);
 
         // m_counter = 0;
@@ -858,8 +967,7 @@ public class ExecutionEngineIPC extends ExecutionEngine {
                 defaultDrBufferSize,
                 1024 * 1024 * tempTableMemory,
                 hashinatorConfig,
-                isLowestSiteId,
-                exportFlushTimeout);
+                isLowestSiteId);
     }
 
     /** Utility method to generate an EEXception that can be overriden by derived classes**/
@@ -914,8 +1022,7 @@ public class ExecutionEngineIPC extends ExecutionEngine {
             final int defaultDrBufferSize,
             final long tempTableMemory,
             final HashinatorConfig hashinatorConfig,
-            final boolean createDrReplicatedStream,
-            final long exportFlushTimeout)
+            final boolean createDrReplicatedStream)
     {
         synchronized(printLockObject) {
             System.out.println("Initializing an IPC EE " + this + " for hostId " + hostId + " siteId " + siteId + " from thread " + Thread.currentThread().getId());
@@ -1191,10 +1298,11 @@ public class ExecutionEngineIPC extends ExecutionEngine {
     @Override
     public byte[] loadTable(final int tableId, final VoltTable table, final long txnId,
             final long spHandle, final long lastCommittedSpHandle, final long uniqueId,
-            boolean returnUniqueViolations, boolean shouldDRStream, long undoToken, boolean elastic)
+            long undoToken, LoadTableCaller caller)
     throws EEException
     {
-        if (returnUniqueViolations) {
+        if (caller == LoadTableCaller.DR || caller == LoadTableCaller.SNAPSHOT_REPORT_UNIQ_VIOLATIONS
+                || caller == LoadTableCaller.BALANCE_PARTITIONS) {
             throw new UnsupportedOperationException("Haven't added IPC support for returning unique violations");
         }
         final ByteBuffer tableBytes = PrivateVoltTableFactory.getTableDataReference(table);
@@ -1207,9 +1315,7 @@ public class ExecutionEngineIPC extends ExecutionEngine {
             m_data.putLong(lastCommittedSpHandle);
             m_data.putLong(uniqueId);
             m_data.putLong(undoToken);
-            m_data.putInt(returnUniqueViolations ? 1 : 0);
-            m_data.putInt(shouldDRStream ? 1 : 0);
-            m_data.putInt(elastic ? 1 : 0);
+            m_data.put(caller.getId());
             verifyDataCapacity(m_data.position() + tableBytes.remaining());
         } while (m_data.position() == 0);
 
@@ -1450,12 +1556,14 @@ public class ExecutionEngineIPC extends ExecutionEngine {
     public boolean activateTableStream(
             int tableId,
             TableStreamType streamType,
+            HiddenColumnFilter hiddenColumnFilter,
             long undoQuantumToken,
             byte[] predicates) {
         m_data.clear();
         m_data.putInt(Commands.ActivateTableStream.m_id);
         m_data.putInt(tableId);
         m_data.putInt(streamType.ordinal());
+        m_data.put(hiddenColumnFilter.getId());
         m_data.putLong(undoQuantumToken);
         m_data.put(predicates); // predicates
 
@@ -1549,19 +1657,20 @@ public class ExecutionEngineIPC extends ExecutionEngine {
     }
 
     @Override
-    public void exportAction(boolean syncAction,
-            long uso, long seqNo, int partitionId, String mTableSignature) {
+    public void exportAction(boolean syncAction, ExportSnapshotTuple sequences,
+            int partitionId, String mStreamName) {
         try {
             m_data.clear();
             m_data.putInt(Commands.ExportAction.m_id);
             m_data.putInt(syncAction ? 1 : 0);
-            m_data.putLong(uso);
-            m_data.putLong(seqNo);
-            if (mTableSignature == null) {
+            m_data.putLong(sequences.getAckOffset());
+            m_data.putLong(sequences.getSequenceNumber());
+            m_data.putLong(sequences.getGenerationId());
+            if (mStreamName == null) {
                 m_data.putInt(-1);
             } else {
-                m_data.putInt(mTableSignature.getBytes("UTF-8").length);
-                m_data.put(mTableSignature.getBytes("UTF-8"));
+                m_data.putInt(mStreamName.getBytes("UTF-8").length);
+                m_data.put(mStreamName.getBytes("UTF-8"));
             }
             m_data.flip();
             m_connection.write();
@@ -1574,8 +1683,10 @@ public class ExecutionEngineIPC extends ExecutionEngine {
             long result_offset = results.getLong();
             if (result_offset < 0) {
                 System.out.println("exportAction failed!  syncAction: " + syncAction + ", Uso: " +
-                    uso + ", seqNo: " + seqNo + ", partitionId: " + partitionId +
-                    ", tableSignature: " + mTableSignature);
+                    sequences.getAckOffset() + ", seqNo: " + sequences.getSequenceNumber() +
+                    ", generationId: " + sequences.getGenerationId() +
+                    ", partitionId: " + partitionId +
+                    ", streamName: " + mStreamName);
             }
         } catch (final IOException e) {
             throw new RuntimeException(e);
@@ -1583,16 +1694,44 @@ public class ExecutionEngineIPC extends ExecutionEngine {
     }
 
     @Override
-    public long[] getUSOForExportTable(String tableSignature) {
+    public boolean deleteMigratedRows(long txnid, long spHandle, long uniqueId,
+            String tableName, long deletableTxnId, long undoToken) {
+        try {
+            m_data.clear();
+            m_data.putInt(Commands.DeleteMigratedRows.m_id);
+            m_data.putLong(txnid);
+            m_data.putLong(spHandle);
+            m_data.putLong(uniqueId);
+            m_data.putLong(deletableTxnId);
+            m_data.putLong(undoToken);
+            m_data.putInt(tableName.getBytes("UTF-8").length);
+            m_data.put(tableName.getBytes("UTF-8"));
+            m_data.flip();
+            m_connection.write();
+
+            ByteBuffer results = ByteBuffer.allocate(1);
+            while (results.remaining() > 0) {
+                m_connection.m_socketChannel.read(results);
+            }
+            results.flip();
+
+            return (results.getInt() == 1);
+        } catch (final IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    @Override
+    public long[] getUSOForExportTable(String streamName) {
         long[] retval = null;
         try {
             m_data.clear();
             m_data.putInt(Commands.GetUSOs.m_id);
-            if (tableSignature == null) {
+            if (streamName == null) {
                 m_data.putInt(-1);
             } else {
-                m_data.putInt(tableSignature.getBytes("UTF-8").length);
-                m_data.put(tableSignature.getBytes("UTF-8"));
+                m_data.putInt(streamName.getBytes("UTF-8").length);
+                m_data.put(streamName.getBytes("UTF-8"));
             }
             m_data.flip();
             m_connection.write();
@@ -1612,24 +1751,6 @@ public class ExecutionEngineIPC extends ExecutionEngine {
         }
 
         return retval;
-    }
-
-    @Override
-    public void processRecoveryMessage( ByteBuffer buffer, long pointer) {
-        try {
-            m_data.clear();
-            m_data.putInt(Commands.RecoveryMessage.m_id);
-            m_data.putInt(buffer.remaining());
-            m_data.put(buffer);
-
-            m_data.flip();
-            m_connection.write();
-
-            m_connection.readStatusByte();
-        } catch (final IOException e) {
-            System.out.println("Exception: " + e.getMessage());
-            throw new RuntimeException(e);
-        }
     }
 
     @Override
@@ -1708,7 +1829,7 @@ public class ExecutionEngineIPC extends ExecutionEngine {
 
     @Override
     public long applyBinaryLog(ByteBuffer logs, long txnId, long spHandle, long lastCommittedSpHandle,
-            long uniqueId, int remoteClusterId, long remoteTxnUniqueId, long undoToken) throws EEException {
+            long uniqueId, int remoteClusterId, long undoToken) throws EEException {
         m_data.clear();
         m_data.putInt(Commands.ApplyBinaryLog.m_id);
         m_data.putLong(txnId);
@@ -1716,7 +1837,6 @@ public class ExecutionEngineIPC extends ExecutionEngine {
         m_data.putLong(lastCommittedSpHandle);
         m_data.putLong(uniqueId);
         m_data.putInt(remoteClusterId);
-        m_data.putLong(remoteTxnUniqueId);
         m_data.putLong(undoToken);
         m_data.put(logs.array());
 
@@ -1791,9 +1911,8 @@ public class ExecutionEngineIPC extends ExecutionEngine {
             }
             return  retval.array();
         } catch (IOException e) {
-            Throwables.propagate(e);
+            throw new RuntimeException(e);
         }
-        throw new RuntimeException("Failed to executeTask in IPC client");
     }
 
     @Override
@@ -1848,6 +1967,35 @@ public class ExecutionEngineIPC extends ExecutionEngine {
             m_connection.write();
         } catch (final IOException e) {
             System.out.println("Excpeption: " + e.getMessage());
+            throw new RuntimeException();
+        }
+    }
+
+    @Override
+    public void disableExternalStreams() {
+        System.out.println("Disabling all external streams in EE");
+        m_data.clear();
+        m_data.putInt(Commands.DisableExternalStreams.m_id);
+        m_data.flip();
+        try {
+            m_connection.write();
+        } catch (final IOException e) {
+            System.out.println("Exception: " + e.getMessage());
+            throw new RuntimeException();
+        }
+    }
+
+    @Override
+    public boolean externalStreamsEnabled() {
+        m_data.clear();
+        m_data.putInt(Commands.ExternalStreamsEnabled.m_id);
+        m_data.flip();
+        try {
+            m_connection.write();
+            m_connection.readStatusByte();
+            return m_connection.readByte() == 1 ? true : false;
+        } catch (final IOException e) {
+            System.out.println("Exception: " + e.getMessage());
             throw new RuntimeException();
         }
     }

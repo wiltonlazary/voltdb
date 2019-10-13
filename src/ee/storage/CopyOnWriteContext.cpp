@@ -25,7 +25,7 @@
 #include "common/StreamPredicateList.h"
 #include "logging/LogManager.h"
 #include <algorithm>
-#include <cassert>
+#include <common/debuglog.h>
 #include <iostream>
 
 namespace voltdb {
@@ -37,6 +37,7 @@ CopyOnWriteContext::CopyOnWriteContext(
         PersistentTable &table,
         PersistentTableSurgeon &surgeon,
         int32_t partitionId,
+        const HiddenColumnFilter &hiddenColumnFilter,
         const std::vector<std::string> &predicateStrings,
         int64_t totalTuples) :
              TableStreamerContext(table, surgeon, partitionId, predicateStrings),
@@ -52,7 +53,8 @@ CopyOnWriteContext::CopyOnWriteContext(
              m_updates(0),
              m_skippedDirtyRows(0),
              m_skippedInactiveRows(0),
-             m_replicated(table.isReplicatedTable())
+             m_replicated(table.isReplicatedTable()),
+             m_hiddenColumnFilter(hiddenColumnFilter)
 {
     if (m_replicated) {
         // There is a corner case where a replicated table is streamed from a thread other than the lowest
@@ -126,7 +128,7 @@ CopyOnWriteContext::handleReactivation(TableStreamType streamType)
  */
 int64_t CopyOnWriteContext::handleStreamMore(TupleOutputStreamProcessor &outputStreams,
                                              std::vector<int> &retPositions) {
-    assert(m_iterator.get() != NULL);
+    vassert(m_iterator.get() != NULL);
 
     // Don't expect to be re-called after streaming all the tuples.
     if (m_totalTuples != 0 && m_tuplesRemaining == 0) {
@@ -168,7 +170,7 @@ int64_t CopyOnWriteContext::handleStreamMore(TupleOutputStreamProcessor &outputS
              * The returned copy count helps decide when to delete if m_doDelete is true.
              */
             bool deleteTuple = false;
-            yield = outputStreams.writeRow(tuple, &deleteTuple);
+            yield = outputStreams.writeRow(tuple, m_hiddenColumnFilter, &deleteTuple);
             /*
              * May want to delete tuple if processing the actual table.
              */
@@ -178,7 +180,7 @@ int64_t CopyOnWriteContext::handleStreamMore(TupleOutputStreamProcessor &outputS
                  * delete and return the tuple if it iscop
                  */
                 if (tuple.isPendingDelete()) {
-                    assert(!tuple.isPendingDeleteOnUndoRelease());
+                    vassert(!tuple.isPendingDeleteOnUndoRelease());
                     CopyOnWriteIterator *iter = static_cast<CopyOnWriteIterator*>(m_iterator.get());
                     //Save the extra lookup if possible
                     m_surgeon.deleteTupleStorage(tuple, iter->m_currentBlock);
@@ -244,7 +246,7 @@ int64_t CopyOnWriteContext::handleStreamMore(TupleOutputStreamProcessor &outputS
                          table.partitionColumn(),
                          m_skippedDirtyRows,
                          m_skippedInactiveRows);
-
+                message[sizeof message - 1] = '\0';
                 // If m_tuplesRemaining is not 0, we somehow corrupted the iterator. To make a best effort
                 // at continuing unscathed, we will make sure all the blocks are back in the non-pending snapshot
                 // lists and hope that the next snapshot handles everything correctly. We assume that the iterator
@@ -310,9 +312,7 @@ int64_t CopyOnWriteContext::handleStreamMore(TupleOutputStreamProcessor &outputS
 
             if (hasMore) {
                 hasMore = m_iterator->next(tuple);
-                if (hasMore) {
-                    assert(false);
-                }
+                vassert(!hasMore);
             }
             yield = true;
         }
@@ -343,7 +343,7 @@ int64_t CopyOnWriteContext::handleStreamMore(TupleOutputStreamProcessor &outputS
 }
 
 bool CopyOnWriteContext::notifyTupleDelete(TableTuple &tuple) {
-    assert(m_iterator.get() != NULL);
+    vassert(m_iterator.get() != NULL);
 
     if (tuple.isDirty() || m_finishedTableScan) {
         return true;
@@ -371,7 +371,7 @@ bool CopyOnWriteContext::notifyTupleDelete(TableTuple &tuple) {
 }
 
 void CopyOnWriteContext::markTupleDirty(TableTuple tuple, bool newTuple) {
-    assert(m_iterator.get() != NULL);
+    vassert(m_iterator.get() != NULL);
 
     /**
      * If this an update or a delete of a tuple that is already dirty then no further action is
@@ -414,7 +414,7 @@ void CopyOnWriteContext::markTupleDirty(TableTuple tuple, bool newTuple) {
 }
 
 void CopyOnWriteContext::notifyBlockWasCompactedAway(TBPtr block) {
-    assert(m_iterator.get() != NULL);
+    vassert(m_iterator.get() != NULL);
     if (m_finishedTableScan) {
         // There was a compaction while we are iterating through the m_backedUpTuples
         // TempTable. Don't do anything because the passed in block is a PersistentTable
@@ -444,8 +444,8 @@ bool CopyOnWriteContext::notifyTupleUpdate(TableTuple &tuple) {
  * Only call it while m_finishedTableScan==false.
  */
 void CopyOnWriteContext::checkRemainingTuples(const std::string &label) {
-    assert(m_iterator.get() != NULL);
-    assert(!m_finishedTableScan);
+    vassert(m_iterator.get() != NULL);
+    vassert(!m_finishedTableScan);
     intmax_t count1 = static_cast<CopyOnWriteIterator*>(m_iterator.get())->countRemaining();
     TableTuple tuple(getTable().schema());
     TableIterator iter = m_backedUpTuples->iterator();
@@ -455,7 +455,7 @@ void CopyOnWriteContext::checkRemainingTuples(const std::string &label) {
     }
     if (m_tuplesRemaining != count1 + count2) {
         char errMsg[1024 * 16];
-        snprintf(errMsg, 1024 * 16,
+        snprintf(errMsg, sizeof errMsg,
                  "CopyOnWriteContext::%s remaining tuple count mismatch: "
                  "table=%s partcol=%d count=%jd count1=%jd count2=%jd "
                  "expected=%jd compacted=%jd batch=%jd "
@@ -464,6 +464,7 @@ void CopyOnWriteContext::checkRemainingTuples(const std::string &label) {
                  count1 + count2, count1, count2, (intmax_t)m_tuplesRemaining,
                  (intmax_t)m_blocksCompacted, (intmax_t)m_serializationBatches,
                  (intmax_t)m_inserts, (intmax_t)m_updates);
+        errMsg[sizeof errMsg - 1] = '\0';
         LogManager::getThreadLogger(LOGGERID_HOST)->log(LOGLEVEL_ERROR, errMsg);
     }
 }

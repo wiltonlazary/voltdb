@@ -17,9 +17,6 @@
 
 package org.voltdb.iv2;
 
-import java.lang.management.ManagementFactory;
-import java.lang.management.ThreadInfo;
-import java.lang.management.ThreadMXBean;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -40,7 +37,6 @@ import java.util.stream.Collectors;
 
 import org.voltcore.logging.VoltLogger;
 import org.voltcore.messaging.HostMessenger;
-import org.voltcore.messaging.Mailbox;
 import org.voltcore.messaging.TransactionInfoBaseMessage;
 import org.voltcore.messaging.VoltMessage;
 import org.voltcore.utils.CoreUtils;
@@ -87,8 +83,6 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
 {
     static final VoltLogger tmLog = new VoltLogger("TM");
     static final VoltLogger hostLog = new VoltLogger("HOST");
-    private static final Object threadDumpLock = new Object();
-    static long txnIdForSiteThreadDump = 0;
     static class DuplicateCounterKey implements Comparable<DuplicateCounterKey> {
         private final long m_txnId;
         private final long m_spHandle;
@@ -138,7 +132,7 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
 
         @Override
         public String toString() {
-            return "[txn:" + TxnEgo.txnIdToString(m_txnId) + "(" + m_txnId + "), spHandle:" + TxnEgo.txnIdToString(m_spHandle) + "(" + m_spHandle + ")]";
+            return "[txn:" + TxnEgo.txnIdToString(m_txnId) + ", spHandle:" + TxnEgo.txnIdToString(m_spHandle) + "]";
         }
 
         public boolean isSpTransaction() {
@@ -206,8 +200,8 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
         IS_KSAFE_CLUSTER = VoltDB.instance().getKFactor() > 0;
     }
 
-    public void initializeScoreboard(int siteId, Mailbox mailBox) {
-        m_pendingTasks.initializeScoreboard(siteId, mailBox);
+    public void initializeScoreboard(int siteId) {
+        m_pendingTasks.initializeScoreboard(siteId);
     }
 
     @Override
@@ -500,10 +494,9 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
     private void handleIv2InitiateTaskMessage(Iv2InitiateTaskMessage message)
     {
         if (!message.isSinglePartition()) {
-            throw new RuntimeException("SpScheduler.handleIv2InitiateTaskMessage " +
-                    "should never receive multi-partition initiations.");
+            VoltDB.crashLocalVoltDB("SpScheduler.handleIv2InitiateTaskMessage " +
+                    "should never receive multi-partition initiations. Invocation: " + message, true, null);
         }
-
         final String procedureName = message.getStoredProcedureName();
         long newSpHandle;
         long uniqueId = Long.MIN_VALUE;
@@ -524,7 +517,6 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
                     VoltDB.crashLocalVoltDB(e.getMessage(), true, e);
                 }
             }
-
             /*
              * If this is CL replay use the txnid from the CL and also
              * update the txnid to match the one from the CL
@@ -655,7 +647,7 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
             traceLog.add(() -> VoltTrace.meta("process_name", "name", CoreUtils.getHostnameOrAddress()))
                     .add(() -> VoltTrace.meta("thread_name", "name", threadName))
                     .add(() -> VoltTrace.meta("thread_sort_index", "sort_index", Integer.toString(10000)))
-                    .add(() -> VoltTrace.beginAsync("initsp",
+                    .add(() -> VoltTrace.beginAsync("localSp",
                                                     MiscUtils.hsIdPairTxnIdToString(m_mailbox.getHSId(), m_mailbox.getHSId(), msg.getSpHandle(), msg.getClientInterfaceHandle()),
                                                     "ciHandle", msg.getClientInterfaceHandle(),
                                                     "txnId", TxnEgo.txnIdToString(msg.getTxnId()),
@@ -812,7 +804,7 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
         // Also, don't update the truncation handle, since it won't have meaning for anyone.
         if (message.isReadOnly()) {
             if (traceLog != null) {
-                traceLog.add(() -> VoltTrace.endAsync("initsp", MiscUtils.hsIdPairTxnIdToString(m_mailbox.getHSId(), message.m_sourceHSId, message.getSpHandle(), message.getClientInterfaceHandle())));
+                traceLog.add(() -> VoltTrace.endAsync("localSp", MiscUtils.hsIdPairTxnIdToString(m_mailbox.getHSId(), message.m_sourceHSId, message.getSpHandle(), message.getClientInterfaceHandle())));
             }
 
             // InvocationDispatcher routes SAFE reads to SPI only
@@ -821,17 +813,16 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
             return;
         }
 
+        if (traceLog != null && message.m_sourceHSId == m_mailbox.getHSId()) {
+            traceLog.add(() -> VoltTrace.endAsync("localSp", MiscUtils.hsIdPairTxnIdToString(m_mailbox.getHSId(), message.m_sourceHSId, message.getSpHandle(), message.getClientInterfaceHandle())/*,
+                                                      "hash", message.getClientResponseData().getHashes()[0]*/));
+        }
+        if (traceLog != null && message.m_sourceHSId != m_mailbox.getHSId()) {
+            traceLog.add(() -> VoltTrace.endAsync("replicateSP",
+                                                    MiscUtils.hsIdPairTxnIdToString(m_mailbox.getHSId(), message.m_sourceHSId, message.getSpHandle(), message.getClientInterfaceHandle())/*,
+                                                  "hash", message.getClientResponseData().getHashes()[0]*/));
+        }
         if (counter != null) {
-            String traceName = "initsp";
-            if (message.m_sourceHSId != m_mailbox.getHSId()) {
-                traceName = "replicatesp";
-            }
-            String finalTraceName = traceName;
-            if (traceLog != null) {
-                traceLog.add(() -> VoltTrace.endAsync(finalTraceName, MiscUtils.hsIdPairTxnIdToString(m_mailbox.getHSId(), message.m_sourceHSId, message.getSpHandle(), message.getClientInterfaceHandle()),
-                                                      "hash", message.getClientResponseData().getHashes()[0]));
-            }
-
             int result = counter.offer(message);
             if (result == DuplicateCounter.DONE) {
                 m_duplicateCounters.remove(dcKey);
@@ -864,11 +855,7 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
                         counter.getStoredProcedureName(), m_procSet);
                 VoltDB.crashLocalVoltDB("HASH MISMATCH: transaction succeeded on one replica but failed on another replica.", true, null);
             }
-        }
-        else {
-            if (traceLog != null) {
-                traceLog.add(() -> VoltTrace.endAsync("initsp", MiscUtils.hsIdPairTxnIdToString(m_mailbox.getHSId(), message.m_sourceHSId, message.getSpHandle(), message.getClientInterfaceHandle())));
-            }
+        } else {
             // the initiatorHSId is the ClientInterface mailbox.
             // this will be on SPI without k-safety or replica only with k-safety
             assert(!message.isReadOnly());
@@ -1453,21 +1440,12 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
         if (m_duplicateCounters.size() > 0) {
             builder.append("\n  DUPLICATE COUNTERS:\n ");
             for (Entry<DuplicateCounterKey, DuplicateCounter> e : m_duplicateCounters.entrySet()) {
-                builder.append("  ").append(e.getKey().toString()).append(": ").append(e.getValue().toString());
+                builder.append("  ").append(e.getKey().toString()).append(": ");
+                e.getValue().dumpCounter(builder);
             }
         }
         builder.append("END of STATE DUMP FOR SITE: ").append(who);
-        synchronized(threadDumpLock) {
-            if (message.getTxnId() > txnIdForSiteThreadDump) {
-                txnIdForSiteThreadDump = message.getTxnId();
-            } else {
-                hostLog.warn(builder.toString());
-                return;
-            }
-        }
-        builder.append("\nSITE THREAD DUMP FROM TXNID:" + TxnEgo.txnIdToString(message.getTxnId()) +"\n");
-        builder.append(generateSiteThreadDump());
-        builder.append("\nEND OF SITE THREAD DUMP FROM TXNID:" + TxnEgo.txnIdToString(message.getTxnId()));
+        dumpStackTraceOnFirstSiteThread(message, builder);
         hostLog.warn(builder.toString());
     }
 
@@ -1646,9 +1624,12 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
     @Override
     public void dump()
     {
-        m_replaySequencer.dump(m_mailbox.getHSId());
-        hostLog.warn("[dump] current truncation handle: " + TxnEgo.txnIdToString(m_repairLogTruncationHandle) + " "
+        StringBuilder sb = new StringBuilder();
+        m_replaySequencer.dump(m_mailbox.getHSId(), sb);
+        sb.append("\n    current truncation handle: " + TxnEgo.txnIdToString(m_repairLogTruncationHandle) + " "
                 + m_bufferedReadLog.toString());
+        m_repairLog.indentedString(sb, 5);
+        hostLog.warn(sb.toString());
     }
 
     private void updateMaxScheduledTransactionSpHandle(long newSpHandle) {
@@ -1734,7 +1715,7 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
             }
         };
         if (hostLog.isDebugEnabled()) {
-            r.taskInfo = "Repair Log Truncate Message Handle:" + m_repairLogTruncationHandle;
+            r.taskInfo = "Repair Log Truncate Message Handle:" + TxnEgo.txnIdToString(m_repairLogTruncationHandle);
         }
         m_tasks.offer(r);
     }
@@ -1754,7 +1735,7 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
     public void checkPointMigratePartitionLeader() {
         m_migratePartitionLeaderCheckPoint = getMaxScheduledTxnSpHandle();
         tmLog.info("MigratePartitionLeader checkpoint on " + CoreUtils.hsIdToString(m_mailbox.getHSId()) +
-                    " sphandle: " + m_migratePartitionLeaderCheckPoint);
+                    " sphandle: " + TxnEgo.txnIdToString(m_migratePartitionLeaderCheckPoint));
     }
 
     public boolean txnDoneBeforeCheckPoint() {
@@ -1771,27 +1752,15 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
                     DuplicateCounter counter = m_duplicateCounters.get(dc);
                     builder.append(counter.m_openMessage + "\n");
                 }
-                tmLog.debug("Duplicate counters on " + CoreUtils.hsIdToString(m_mailbox.getHSId()) + " have keys smaller than the sphandle:" + m_migratePartitionLeaderCheckPoint + "\n" + builder.toString());
+                tmLog.debug("Duplicate counters on " + CoreUtils.hsIdToString(m_mailbox.getHSId()) + " have keys smaller than the sphandle:" +
+                        TxnEgo.txnIdToString(m_migratePartitionLeaderCheckPoint) + "\n" + builder.toString());
             }
             return false;
         }
         tmLog.info("MigratePartitionLeader previous leader " + CoreUtils.hsIdToString(m_mailbox.getHSId()) +
-                " has completed transactions before sphandle: " + m_migratePartitionLeaderCheckPoint);
+                " has completed transactions before sphandle: " + TxnEgo.txnIdToString(m_migratePartitionLeaderCheckPoint));
         m_migratePartitionLeaderCheckPoint = Long.MIN_VALUE;
         return true;
-    }
-
-    //When a partition leader is migrated from one host to a new host, the new host may fail before it gets chance
-    //to allow the site to be promoted. Remove the sites on the new host from the replica list and
-    //update the duplicated counters after the host failure.
-    public void updateReplicasFromMigrationLeaderFailedHost(int failedHostId) {
-        List<Long> replicas = new ArrayList<>();
-        for (long hsid : m_replicaHSIds) {
-            if (failedHostId != CoreUtils.getHostIdFromHSId(hsid)) {
-                replicas.add(hsid);
-            }
-        }
-        ((InitiatorMailbox)m_mailbox).updateReplicas(replicas, null);
     }
 
     // Because now in rejoin we rely on first fragment of stream snapshot to update the replica
@@ -1853,17 +1822,5 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
 
         // flush all RO transactions out of backlog
         m_pendingTasks.removeMPReadTransactions();
-    }
-
-    private static String generateSiteThreadDump() {
-        StringBuilder threadDumps = new StringBuilder();
-        ThreadMXBean threadMXBean = ManagementFactory.getThreadMXBean();
-        ThreadInfo[] threadInfos = threadMXBean.dumpAllThreads(true, true);
-        for (ThreadInfo t : threadInfos) {
-            if (t.getThreadName().startsWith("SP") || t.getThreadName().startsWith("MP Site") || t.getThreadName().startsWith("RO MP Site")) {
-                threadDumps.append(t);
-            }
-        }
-        return threadDumps.toString();
     }
 }

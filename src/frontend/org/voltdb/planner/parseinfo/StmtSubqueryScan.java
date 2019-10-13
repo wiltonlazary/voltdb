@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Set;
 
 import org.voltdb.catalog.Index;
+import org.voltdb.exceptions.PlanningErrorException;
 import org.voltdb.expressions.AbstractExpression;
 import org.voltdb.expressions.TupleValueExpression;
 import org.voltdb.planner.AbstractParsedStmt;
@@ -31,7 +32,6 @@ import org.voltdb.planner.CompiledPlan;
 import org.voltdb.planner.ParsedColInfo;
 import org.voltdb.planner.ParsedSelectStmt;
 import org.voltdb.planner.ParsedUnionStmt;
-import org.voltdb.planner.PlanningErrorException;
 import org.voltdb.planner.StatementPartitioning;
 import org.voltdb.planner.StmtEphemeralTableScan;
 import org.voltdb.plannodes.SchemaColumn;
@@ -95,7 +95,10 @@ public class StmtSubqueryScan extends StmtEphemeralTableScan {
     public void promoteSinglePartitionInfo(
             HashMap<AbstractExpression, Set<AbstractExpression>> valueEquivalence,
             Set< Set<AbstractExpression> > eqSets) {
-        assert(getScanPartitioning() != null);
+        if (getScanPartitioning() == null) {
+            throw new PlanningErrorException("Unsupported statement, subquery expressions are only supported for " +
+                    "single partition procedures and AdHoc replicated tables.");
+        }
         if (getScanPartitioning().getCountOfPartitionedTables() == 0 ||
                 getScanPartitioning().requiresTwoFragments()) {
             return;

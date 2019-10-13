@@ -58,6 +58,7 @@ public class DefaultProcedureManager {
     private final Database m_fakeDb;
 
     public static final String NIBBLE_DELETE_PROC = "nibbledelete";
+    public static final String NIBBLE_MIGRATE_PROC = "nibblemigrate";
 
     public DefaultProcedureManager(Database db) {
         m_db = db;
@@ -73,7 +74,7 @@ public class DefaultProcedureManager {
         for (Table table : m_db.getTables()) {
             String prefix = table.getTypeName() + '.';
 
-            if (CatalogUtil.isTableExportOnly(m_db, table)) {
+            if (CatalogUtil.isStream(m_db, table)) {
                 Column partitioncolumn = table.getPartitioncolumn();
                 if (partitioncolumn != null) {
                     int partitionIndex = partitioncolumn.getIndex();
@@ -166,7 +167,6 @@ public class DefaultProcedureManager {
         String name = defaultProc.getClassname();
         String[] parts = name.split("\\.");
         String action = parts[1];
-
         Table table = defaultProc.getPartitiontable();
         Column partitionColumn = defaultProc.getPartitioncolumn();
 
@@ -188,35 +188,33 @@ public class DefaultProcedureManager {
         case "insert":
             if (defaultProc.getSinglepartition()) {
                 return generateCrudInsert(table, partitionColumn);
-            }
-            else {
+            } else {
                 return generateCrudReplicatedInsert(table);
             }
         case "update":
             if (defaultProc.getSinglepartition()) {
                 return generateCrudUpdate(table, partitionColumn, pkey);
-            }
-            else {
+            } else {
                 return generateCrudReplicatedUpdate(table, pkey);
             }
         case "delete":
             if (defaultProc.getSinglepartition()) {
                 return generateCrudDelete(table, partitionColumn, pkey);
-            }
-            else {
+            } else {
                 return generateCrudReplicatedDelete(table, pkey);
             }
+        case DefaultProcedureManager.NIBBLE_MIGRATE_PROC:
+            return generateNibbleDelete(defaultProc);
         case "upsert":
             if (defaultProc.getSinglepartition()) {
                 return generateCrudUpsert(table, partitionColumn);
-            }
-            else {
+            } else {
                 return generateCrudReplicatedUpsert(table, pkey);
             }
-        case "nibbledelete":
+        case DefaultProcedureManager.NIBBLE_DELETE_PROC:
             return generateNibbleDelete(defaultProc);
         default:
-            throw new RuntimeException("Invalid input to default proc SQL generator.");
+            throw new RuntimeException("Invalid input to default proc SQL generator (" + action + ")");
         }
     }
 
@@ -320,6 +318,20 @@ public class DefaultProcedureManager {
             sb.append("?");
         }
         sb.append(")");
+    }
+
+    /**
+     * Create a statement like:
+     * "MIGRATE FROM <table> where {...}"
+     * @param table target table
+     * @param partitioncolumn partition column of a partitioned table, or null if table is replicated
+     * @param pkey primary key
+     * @return statement string
+     */
+    private static String generateCrudMigrate(Table table, Column partitioncolumn, Constraint pkey) {
+        final StringBuilder sb = new StringBuilder("MIGRATE FROM ").append(table.getTypeName());
+        generateCrudPKeyWhereClause(partitioncolumn, pkey, sb);
+        return sb.append(';').toString();
     }
 
     /**
