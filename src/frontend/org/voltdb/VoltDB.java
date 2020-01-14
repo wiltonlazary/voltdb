@@ -882,6 +882,7 @@ public class VoltDB {
         public Map<String, String> asNodeSettingsMap() {
             return ImmutableMap.<String, String>builder()
                     .put(NodeSettings.LOCAL_SITES_COUNT_KEY, Integer.toString(m_sitesperhost))
+                    .put(NodeSettings.LOCAL_ACTIVE_SITES_COUNT_KEY, Integer.toString(m_sitesperhost))
                     .build();
         }
 
@@ -903,7 +904,6 @@ public class VoltDB {
          * Checks for the initialization marker on initialized voltdbroot directory
          */
         private void checkInitializationMarker() {
-
             File inzFH = new VoltFile(m_voltdbRoot, VoltDB.INITIALIZED_MARKER);
             File deploymentFH = new VoltFile(new VoltFile(m_voltdbRoot, Constants.CONFIG_DIR), "deployment.xml");
             File configCFH = null;

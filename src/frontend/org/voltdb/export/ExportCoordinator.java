@@ -355,13 +355,16 @@ public class ExportCoordinator {
                                 exportLog.debug(getNewLeaderMessage());
                             }
 
-                            // If leader and maps empty request ExportSequenceNumberTracker from all nodes.
-                            // Note: cannot initiate a coordinator task directly from here, must go
-                            // through another runnable and the invocation path.
                             if (isPartitionLeader() && m_trackers.isEmpty()) {
+                                // If leader and maps empty request ExportSequenceNumberTracker from all nodes.
+                                // Note: cannot initiate a coordinator task directly from here, must go
+                                // through another runnable and the invocation path.
                                 requestTrackers();
+                            } else {
+                                // Reset the safe point and resume polling to force a Mastership re-evaluation
+                                resetSafePoint();
+                                m_eds.resumePolling();
                             }
-
                         } catch (Exception e) {
                             exportLog.error("Failed to change to new leader: " + e);
 
@@ -999,7 +1002,8 @@ public class ExportCoordinator {
     }
 
     /**
-     * Returns true if the acked sequence number passes the safe point.
+     * Returns true if the acked sequence number passes the safe point,
+     * or if the safe point needs to be re-evaluated.
      *
      * @param ackedSeqNo the acked sequence number
      * @return true if this passed the safe point
@@ -1019,8 +1023,7 @@ public class ExportCoordinator {
             return false;
         }
 
-        if (m_safePoint == 0L || m_safePoint > ackedSeqNo) {
-            // Not waiting for safe point or not reached safe point
+        if (m_safePoint > ackedSeqNo) {
             return false;
         }
         resetSafePoint();

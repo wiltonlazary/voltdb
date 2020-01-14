@@ -64,6 +64,7 @@ public interface VoltDBInterface
     public String getExportOverflowPath(PathsType.Exportoverflow path);
     public String getDROverflowPath(PathsType.Droverflow path);
     public String getLargeQuerySwapPath(Largequeryswap path);
+    public String getExportCursorPath(PathsType.Exportcursor path);
 
     public String getVoltDBRootPath();
     public String getCommandLogSnapshotPath();
@@ -72,6 +73,7 @@ public interface VoltDBInterface
     public String getExportOverflowPath();
     public String getDROverflowPath();
     public String getLargeQuerySwapPath();
+    public String getExportCursorPath();
 
     public boolean isBare();
     public boolean isClusterComplete();
@@ -358,4 +360,7 @@ public interface VoltDBInterface
      * notify surviving node upon shutting itself down
      */
     public void notifyOfShutdown();
+
+    boolean isMasterOnly();
+    void setMasterOnly();
 }

@@ -166,9 +166,6 @@ class PbdQuarantinedSegment<M> extends PBDSegment<M> {
         }
 
         @Override
-        public void purge() {}
-
-        @Override
         public BBContainer poll(OutputContainerFactory factory) {
             return null;
         }
@@ -189,11 +186,21 @@ class PbdQuarantinedSegment<M> extends PBDSegment<M> {
         }
 
         @Override
-        public void close() {}
-
-        @Override
         public boolean anyReadAndDiscarded() {
             return false;
+        }
+
+        @Override
+        public boolean allReadAndDiscarded() {
+            return false;
+        }
+
+        @Override
+        public void close() {
+        }
+
+        @Override
+        public void closeAndSaveReaderState() {
         }
     };
 }

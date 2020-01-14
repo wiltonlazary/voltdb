@@ -40,7 +40,7 @@ public class UpdateClassesThread extends BenchmarkThread {
     final AtomicBoolean m_shouldContinue = new AtomicBoolean(true);
     final AtomicBoolean m_needsBlock = new AtomicBoolean(false);
     final byte[] jarData;
-    final long cycletime = 3000;
+    final long cycletime = 10000;
 
     public UpdateClassesThread(Client client, long duration_secs) {
         log.info("UpdateClasses initializing...");
@@ -87,9 +87,9 @@ public class UpdateClassesThread extends BenchmarkThread {
 
         while (m_shouldContinue.get()) {
             // if not, connected, sleep
+            try { Thread.sleep(cycletime); } catch (Exception e) {}
             if (m_needsBlock.get()) {
                 do {
-                    try { Thread.sleep(cycletime); } catch (Exception e) {} // sleep for 3s
                     // bail on wakeup if we're supposed to bail
                     if (!m_shouldContinue.get()) {
                         return;
@@ -97,8 +97,6 @@ public class UpdateClassesThread extends BenchmarkThread {
                 }
                 while (client.getConnectedHostList().size() == 0);
                 m_needsBlock.set(false);
-            } else {
-                try { Thread.sleep(1); } catch (Exception e) {}
             }
 
             // call a transaction

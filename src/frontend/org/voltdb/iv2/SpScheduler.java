@@ -17,6 +17,7 @@
 
 package org.voltdb.iv2;
 
+import java.io.IOException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -35,6 +36,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.stream.Collectors;
 
+import org.apache.zookeeper_voltpatches.CreateMode;
 import org.voltcore.logging.VoltLogger;
 import org.voltcore.messaging.HostMessenger;
 import org.voltcore.messaging.TransactionInfoBaseMessage;
@@ -43,18 +45,23 @@ import org.voltcore.utils.CoreUtils;
 import org.voltdb.ClientResponseImpl;
 import org.voltdb.CommandLog;
 import org.voltdb.CommandLog.DurabilityListener;
+import org.voltdb.LogEntryType;
 import org.voltdb.RealVoltDB;
 import org.voltdb.SnapshotCompletionInterest;
 import org.voltdb.SnapshotCompletionMonitor;
+import org.voltdb.StoredProcedureInvocation;
 import org.voltdb.SystemProcedureCatalog;
 import org.voltdb.VoltDB;
 import org.voltdb.VoltDBInterface;
 import org.voltdb.VoltTable;
+import org.voltdb.VoltZK;
 import org.voltdb.client.ClientResponse;
 import org.voltdb.dtxn.TransactionState;
 import org.voltdb.exceptions.SerializableException;
 import org.voltdb.exceptions.TransactionRestartException;
+import org.voltdb.iv2.DuplicateCounter.HashResult;
 import org.voltdb.iv2.SiteTasker.SiteTaskerRunnable;
+import org.voltdb.iv2.SpInitiator.ServiceState;
 import org.voltdb.messaging.BorrowTaskMessage;
 import org.voltdb.messaging.CompleteTransactionMessage;
 import org.voltdb.messaging.CompleteTransactionResponseMessage;
@@ -64,12 +71,15 @@ import org.voltdb.messaging.DumpMessage;
 import org.voltdb.messaging.DumpPlanThenExitMessage;
 import org.voltdb.messaging.FragmentResponseMessage;
 import org.voltdb.messaging.FragmentTaskMessage;
+import org.voltdb.messaging.HashMismatchMessage;
 import org.voltdb.messaging.InitiateResponseMessage;
 import org.voltdb.messaging.Iv2InitiateTaskMessage;
 import org.voltdb.messaging.Iv2LogFaultMessage;
 import org.voltdb.messaging.MPBacklogFlushMessage;
+import org.voltdb.messaging.MigratePartitionLeaderMessage;
 import org.voltdb.messaging.MultiPartitionParticipantMessage;
 import org.voltdb.messaging.RepairLogTruncationMessage;
+import org.voltdb.utils.CatalogUtil;
 import org.voltdb.utils.MiscUtils;
 import org.voltdb.utils.VoltTrace;
 
@@ -186,6 +196,8 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
 
     private final boolean IS_KSAFE_CLUSTER;
 
+    private ServiceState m_serviceState;
+
     SpScheduler(int partitionId, SiteTaskerQueue taskQueue, SnapshotCompletionMonitor snapMonitor, boolean scoreboardEnabled)
     {
         super(partitionId, taskQueue);
@@ -290,8 +302,8 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
         List<DuplicateCounterKey> doneCounters = new LinkedList<DuplicateCounterKey>();
         for (Entry<DuplicateCounterKey, DuplicateCounter> entry : m_duplicateCounters.entrySet()) {
             DuplicateCounter counter = entry.getValue();
-            int result = counter.updateReplicas(m_replicaHSIds);
-            if (result == DuplicateCounter.DONE) {
+            HashResult result = counter.updateReplicas(m_replicaHSIds);
+            if (result.isDone()) {
                 doneCounters.add(entry.getKey());
             }
         }
@@ -614,7 +626,8 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
                         msg.getInitiatorHSId(),
                         msg.getTxnId(),
                         m_replicaHSIds,
-                        replmsg);
+                        replmsg,
+                        m_mailbox.getHSId());
 
                 safeAddToDuplicateCounterMap(new DuplicateCounterKey(msg.getTxnId(), newSpHandle), counter);
             }
@@ -709,19 +722,16 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
 
         // set up duplicate counter. expect exactly the responses corresponding
         // to needsRepair. These may, or may not, include the local site.
-
-        // We currently send the final response into the ether, since we don't
-        // have the original ClientInterface HSID stored.  It would be more
-        // useful to have the original ClienInterface HSId somewhere handy.
-
         List<Long> expectedHSIds = new ArrayList<Long>(needsRepair);
         DuplicateCounter counter = new DuplicateCounter(
                 HostMessenger.VALHALLA,
                 message.getTxnId(),
                 expectedHSIds,
-                message);
-        safeAddToDuplicateCounterMap(new DuplicateCounterKey(message.getTxnId(), message.getSpHandle()), counter);
+                message,
+                m_mailbox.getHSId());
 
+        final DuplicateCounterKey dcKey = new DuplicateCounterKey(message.getTxnId(), message.getSpHandle());
+        updateOrAddDuplicateCounter(dcKey, counter);
         m_uniqueIdGenerator.updateMostRecentlyGeneratedUniqueId(message.getUniqueId());
         // is local repair necessary?
         if (needsRepair.contains(m_mailbox.getHSId())) {
@@ -738,32 +748,33 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
             //to replica for repair
             Iv2InitiateTaskMessage replmsg =
                 new Iv2InitiateTaskMessage(m_mailbox.getHSId(), m_mailbox.getHSId(), message, true);
-            m_mailbox.send(com.google_voltpatches.common.primitives.Longs.toArray(needsRepair), replmsg);
+            m_mailbox.send(Longs.toArray(needsRepair), replmsg);
         }
     }
 
     private void handleFragmentTaskMessageRepair(List<Long> needsRepair, FragmentTaskMessage message)
     {
+        if (needsRepair.contains(m_mailbox.getHSId()) && m_outstandingTxns.get(message.getTxnId()) != null) {
+            // Sanity check that we really need repair.
+            hostLog.warn("SPI repair attempted to repair a fragment which it has already seen. " +
+                    "This shouldn't be possible.");
+            // Not sure what to do in this event.  Crash for now
+            throw new RuntimeException("Attempted to repair with a fragment we've already seen.");
+        }
         // set up duplicate counter. expect exactly the responses corresponding
         // to needsRepair. These may, or may not, include the local site.
-
         List<Long> expectedHSIds = new ArrayList<Long>(needsRepair);
         DuplicateCounter counter = new DuplicateCounter(
                 message.getCoordinatorHSId(), // Assume that the MPI's HSID hasn't changed
                 message.getTxnId(),
                 expectedHSIds,
-                message);
-        safeAddToDuplicateCounterMap(new DuplicateCounterKey(message.getTxnId(), message.getSpHandle()), counter);
+                message,
+                m_mailbox.getHSId());
 
+        final DuplicateCounterKey dcKey = new DuplicateCounterKey(message.getTxnId(), message.getSpHandle());
+        updateOrAddDuplicateCounter(dcKey, counter);
         // is local repair necessary?
         if (needsRepair.contains(m_mailbox.getHSId())) {
-            // Sanity check that we really need repair.
-            if (m_outstandingTxns.get(message.getTxnId()) != null) {
-                hostLog.warn("SPI repair attempted to repair a fragment which it has already seen. " +
-                        "This shouldn't be possible.");
-                // Not sure what to do in this event.  Crash for now
-                throw new RuntimeException("Attempted to repair with a fragment we've already seen.");
-            }
             needsRepair.remove(m_mailbox.getHSId());
             // make a copy because handleIv2 non-repair case does?
             FragmentTaskMessage localWork =
@@ -776,7 +787,26 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
         if (!needsRepair.isEmpty()) {
             FragmentTaskMessage replmsg =
                 new FragmentTaskMessage(m_mailbox.getHSId(), m_mailbox.getHSId(), message);
-            m_mailbox.send(com.google_voltpatches.common.primitives.Longs.toArray(needsRepair), replmsg);
+            m_mailbox.send(Longs.toArray(needsRepair), replmsg);
+        }
+    }
+
+    private void updateOrAddDuplicateCounter(final DuplicateCounterKey dcKey, DuplicateCounter counter) {
+        DuplicateCounter theCounter = m_duplicateCounters.get(dcKey);
+        if (theCounter == null) {
+            counter.setTransactionRepair(true);
+            safeAddToDuplicateCounterMap(dcKey, counter);
+        } else {
+            // The partition leader on the local site is being migrated away, but the migration fails. The local site
+            // can be elected again as leader. In this case, update the duplicate counter.
+
+            // If local site is already in the duplicate counter, retain it.
+            List<Long> expectedHSIDs = new ArrayList<Long>(counter.m_expectedHSIds);
+            if (!expectedHSIDs.contains(m_mailbox.getHSId())) {
+                expectedHSIDs.add(m_mailbox.getHSId());
+            }
+            theCounter.setTransactionRepair(true);
+            theCounter.updateReplicas(expectedHSIDs);
         }
     }
 
@@ -823,37 +853,29 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
                                                   "hash", message.getClientResponseData().getHashes()[0]*/));
         }
         if (counter != null) {
-            int result = counter.offer(message);
-            if (result == DuplicateCounter.DONE) {
-                m_duplicateCounters.remove(dcKey);
-                final TransactionState txn = m_outstandingTxns.get(message.getTxnId());
-                setRepairLogTruncationHandle(spHandle, (txn != null && txn.isLeaderMigrationInvolved()));
-                m_mailbox.send(counter.m_destinationId, counter.m_lastResponse);
-            }
-            else if (result == DuplicateCounter.MISMATCH) {
-                if (m_isLeader && m_sendToHSIds.length > 0) {
-                    StringBuilder sb = new StringBuilder();
-                    for (long hsId : m_sendToHSIds) {
-                        sb.append(CoreUtils.getHostIdFromHSId(hsId) + ":" + CoreUtils.getSiteIdFromHSId(hsId)).append(" ");
+            HashResult result = counter.offer(message);
+            if (result.isDone()) {
+                if (counter.isSuccess() || (!counter.isSuccess() && m_isEnterpriseLicense)) {
+                    m_duplicateCounters.remove(dcKey);
+                    final TransactionState txn = m_outstandingTxns.get(message.getTxnId());
+                    setRepairLogTruncationHandle(spHandle, (txn != null && txn.isLeaderMigrationInvolved()));
+                    if (!counter.isSuccess()) {
+                        sendServiceStateUpdateRequest(counter);
                     }
-                    hostLog.info("Send dump plan message to other replicas: " + sb.toString());
-                    m_mailbox.send(m_sendToHSIds, new DumpPlanThenExitMessage(counter.getStoredProcedureName()));
-                }
-                RealVoltDB.printDiagnosticInformation(VoltDB.instance().getCatalogContext(),
-                        counter.getStoredProcedureName(), m_procSet);
-                VoltDB.crashLocalVoltDB("HASH MISMATCH: replicas produced different results.", true, null);
-            } else if (result == DuplicateCounter.ABORT) {
-                if (m_isLeader && m_sendToHSIds.length > 0) {
-                    StringBuilder sb = new StringBuilder();
-                    for (long hsId : m_sendToHSIds) {
-                        sb.append(CoreUtils.getHostIdFromHSId(hsId) + ":" + CoreUtils.getSiteIdFromHSId(hsId)).append(" ");
+                    m_mailbox.send(counter.m_destinationId, counter.m_lastResponse);
+                } else {
+                    if (m_isLeader && m_sendToHSIds.length > 0) {
+                        StringBuilder sb = new StringBuilder();
+                        for (long hsId : m_sendToHSIds) {
+                            sb.append(CoreUtils.getHostIdFromHSId(hsId) + ":" + CoreUtils.getSiteIdFromHSId(hsId)).append(" ");
+                        }
+                        hostLog.info("Send dump plan message to other replicas: " + sb.toString());
+                        m_mailbox.send(m_sendToHSIds, new DumpPlanThenExitMessage(counter.getStoredProcedureName()));
                     }
-                    hostLog.info("Send dump plan message to other replicas: " + sb.toString());
-                    m_mailbox.send(m_sendToHSIds, new DumpPlanThenExitMessage(counter.getStoredProcedureName()));
+                    RealVoltDB.printDiagnosticInformation(VoltDB.instance().getCatalogContext(),
+                            counter.getStoredProcedureName(), m_procSet);
+                    VoltDB.crashLocalVoltDB("Hash mismatch: replicas produced different results.", true, null);
                 }
-                RealVoltDB.printDiagnosticInformation(VoltDB.instance().getCatalogContext(),
-                        counter.getStoredProcedureName(), m_procSet);
-                VoltDB.crashLocalVoltDB("HASH MISMATCH: transaction succeeded on one replica but failed on another replica.", true, null);
             }
         } else {
             // the initiatorHSId is the ClientInterface mailbox.
@@ -873,6 +895,23 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
         //m_mailbox can be MockMailBox for unit test.
         if (!m_isLeader && m_mailbox instanceof InitiatorMailbox) {
             ((InitiatorMailbox)m_mailbox).notifyNewLeaderOfTxnDoneIfNeeded();
+        }
+    }
+
+    private void sendServiceStateUpdateRequest(DuplicateCounter counter){
+        m_mailbox.send(Longs.toArray(counter.getMisMatchedReplicas()), new HashMismatchMessage());
+        tmLog.warn("Hash mismatch is detected on replicas:" + CoreUtils.hsIdCollectionToString(counter.getMisMatchedReplicas()));
+
+        final HostMessenger hostMessenger = VoltDB.instance().getHostMessenger();
+        VoltZK.createActionBlocker(hostMessenger.getZK(), VoltZK.reducedClusterSafety,
+                CreateMode.PERSISTENT, tmLog, "Transfer to Reduced Safety Mode");
+
+        if (VoltDB.instance().isClusterComplete()) {
+            MigratePartitionLeaderMessage message = new MigratePartitionLeaderMessage(m_mailbox.getHSId(), Integer.MIN_VALUE);
+            Set<Integer> liveHids = hostMessenger.getLiveHostIds();
+            for (Integer integer : liveHids) {
+                m_mailbox.send(CoreUtils.getHSIdFromHostAndSite(integer, HostMessenger.CLIENT_INTERFACE_SITE_ID), message);
+            }
         }
     }
 
@@ -1010,14 +1049,16 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
                             msg.getCoordinatorHSId(),
                             msg.getTxnId(),
                             m_replicaHSIds,
-                            replmsg);
+                            replmsg,
+                            m_mailbox.getHSId());
                 }
                 else {
                     counter = new SysProcDuplicateCounter(
                             msg.getCoordinatorHSId(),
                             msg.getTxnId(),
                             m_replicaHSIds,
-                            replmsg);
+                            replmsg,
+                            m_mailbox.getHSId());
                 }
                 safeAddToDuplicateCounterMap(new DuplicateCounterKey(message.getTxnId(), newSpHandle), counter);
             }
@@ -1083,7 +1124,41 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
         }
 
         TransactionTask task;
+        Iv2InitiateTaskMessage clMessage = msg.getInitiateTask();
         if (msg.isSysProcTask()) {
+            // inject catalog bytes into c/l
+            if (logThis && clMessage != null && ("@UpdateCore").equalsIgnoreCase(msg.getProcedureName())) {
+                // Only one site writes the real UAC initiate task, other sites write dummy tasks, to command log
+                Iv2InitiateTaskMessage uac = clMessage;
+                StoredProcedureInvocation invocation = new StoredProcedureInvocation();
+                invocation.setProcName("@UpdateCore");
+                if (m_isLowestSiteId) {
+                    // First find the expected catalog version in the parameters
+                    CatalogUtil.copyUACParameters(invocation, uac.getParameters());
+                    invocation.setClientHandle(uac.getStoredProcedureInvocation().getClientHandle());
+                    if (invocation.getSerializedParams() == null) {
+                        try {
+                            invocation = MiscUtils.roundTripForCL(invocation);
+                        } catch (IOException e) {
+                            hostLog.fatal("Failed to serialize invocation @UpdateCore: " + e.getMessage());
+                            VoltDB.crashLocalVoltDB(e.getMessage(), true, e);
+                        }
+                    }
+                }
+                clMessage = new Iv2InitiateTaskMessage(
+                        uac.getInitiatorHSId(),
+                        uac.getCoordinatorHSId(),
+                        uac.getTruncationHandle(),
+                        uac.getTxnId(),
+                        uac.getUniqueId(),
+                        uac.isReadOnly(),
+                        uac.isSinglePartition(),
+                        uac.getNParitionIds(),
+                        invocation,
+                        uac.getClientInterfaceHandle(),
+                        uac.getConnectionId(),
+                        uac.isForReplay());
+            }
             task =
                 new SysprocFragmentTask(m_mailbox, (ParticipantTransactionState)txn,
                                         m_pendingTasks, msg, null);
@@ -1095,7 +1170,7 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
         }
         if (logThis) {
             ListenableFuture<Object> durabilityBackpressureFuture =
-                    m_cl.log(msg.getInitiateTask(), msg.getSpHandle(), Ints.toArray(msg.getInvolvedPartitions()),
+                    m_cl.log(clMessage, msg.getSpHandle(), Ints.toArray(msg.getInvolvedPartitions()),
                              m_durabilityListener, task);
 
             if (traceLog != null && durabilityBackpressureFuture != null) {
@@ -1208,23 +1283,25 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
                 traceLog.add(() -> VoltTrace.endAsync(finalTraceName, MiscUtils.hsIdPairTxnIdToString(m_mailbox.getHSId(), message.m_sourceHSId, message.getSpHandle(), message.getTxnId()),
                                                       "status", message.getStatusCode()));
             }
-            int result = counter.offer(message);
-            if (result == DuplicateCounter.DONE) {
-                if (txn != null && txn.isDone()) {
-                    setRepairLogTruncationHandle(txn.m_spHandle, txn.isLeaderMigrationInvolved());
-                }
+            HashResult result = counter.offer(message);
+            if (result.isDone()) {
+                if (counter.isSuccess() || (!counter.isSuccess() && m_isEnterpriseLicense)) {
+                    if (txn != null && txn.isDone()) {
+                        setRepairLogTruncationHandle(txn.m_spHandle, txn.isLeaderMigrationInvolved());
+                    }
 
-                m_duplicateCounters.remove(new DuplicateCounterKey(message.getTxnId(), message.getSpHandle()));
-                FragmentResponseMessage resp = (FragmentResponseMessage)counter.getLastResponse();
-                // MPI is tracking deps per partition HSID.  We need to make
-                // sure we write ours into the message getting sent to the MPI
-                resp.setExecutorSiteId(m_mailbox.getHSId());
-                m_mailbox.send(counter.m_destinationId, resp);
-            }
-            else if (result == DuplicateCounter.MISMATCH) {
-                VoltDB.crashGlobalVoltDB("HASH MISMATCH running multi-part procedure.", true, null);
-            } else if (result == DuplicateCounter.ABORT) {
-                VoltDB.crashGlobalVoltDB("PARTIAL ROLLBACK/ABORT running multi-part procedure.", true, null);
+                    m_duplicateCounters.remove(new DuplicateCounterKey(message.getTxnId(), message.getSpHandle()));
+                    FragmentResponseMessage resp = (FragmentResponseMessage)counter.getLastResponse();
+                    // MPI is tracking deps per partition HSID.  We need to make
+                    // sure we write ours into the message getting sent to the MPI
+                    resp.setExecutorSiteId(m_mailbox.getHSId());
+                    if (!counter.isSuccess()) {
+                        sendServiceStateUpdateRequest(counter);
+                    }
+                    m_mailbox.send(counter.m_destinationId, resp);
+                } else {
+                    VoltDB.crashGlobalVoltDB("Hash mismatch running multi-part procedure.", true, null);
+                }
             }
             // doing duplicate suppression: all done.
             return;
@@ -1251,7 +1328,11 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
             traceLog.add(() -> VoltTrace.endAsync("recvfragment", MiscUtils.hsIdPairTxnIdToString(m_mailbox.getHSId(), message.m_sourceHSId, message.getSpHandle(), message.getTxnId()),
                                                   "status", message.getStatusCode()));
         }
-        m_mailbox.send(message.getDestinationSiteId(), message);
+
+        // Message arrives after duplicate counter is cleaned/removed, do not send to itself
+        if (message.m_sourceHSId != message.getDestinationSiteId()) {
+            m_mailbox.send(message.getDestinationSiteId(), message);
+        }
     }
 
     private void handleCompleteTransactionMessage(CompleteTransactionMessage message)
@@ -1300,7 +1381,8 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
                 counter = new DuplicateCounter(msg.getCoordinatorHSId(),
                                                msg.getTxnId(),
                                                m_replicaHSIds,
-                                               msg);
+                                               msg,
+                                               m_mailbox.getHSId());
                 safeAddToDuplicateCounterMap(new DuplicateCounterKey(msg.getTxnId(), msg.getSpHandle()), counter);
             }
 
@@ -1345,7 +1427,7 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
         }
 
         if (counter != null) {
-            txnDone = counter.offer(msg) == DuplicateCounter.DONE;
+            txnDone = counter.offer(msg).isDone();
         }
 
         if (txnDone) {
@@ -1469,7 +1551,7 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
                         HostMessenger.VALHALLA,
                         msg.getTxnId(),
                         m_replicaHSIds,
-                        msg);
+                        msg,m_mailbox.getHSId());
                 safeAddToDuplicateCounterMap(new DuplicateCounterKey(msg.getTxnId(), newSpHandle), counter);
             }
         } else {
@@ -1504,8 +1586,8 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
             return;
         }
 
-        int result = counter.offer(message);
-        if (result == DuplicateCounter.DONE) {
+        HashResult result = counter.offer(message);
+        if (result.isDone()) {
             // DummyTransactionResponseMessage ends on SPI
             m_duplicateCounters.remove(dcKey);
             setRepairLogTruncationHandle(spHandle, false);
@@ -1518,7 +1600,7 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
                        CoreUtils.getHostIdFromHSId(msg.m_sourceHSId) + ":" + CoreUtils.getSiteIdFromHSId(msg.m_sourceHSId));
         RealVoltDB.printDiagnosticInformation(VoltDB.instance().getCatalogContext(),
                 msg.getProcName(), m_procSet);
-        VoltDB.crashLocalVoltDB("HASH MISMATCH", true, null);
+        VoltDB.crashLocalVoltDB("Hash mismatch", true, null);
     }
 
     @Override
@@ -1557,6 +1639,21 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
             // Generate Iv2LogFault message and send it to replicas
             Iv2LogFaultMessage faultMsg = new Iv2LogFaultMessage(faultSpHandle, lastUniqueId);
             m_mailbox.send(m_sendToHSIds, faultMsg);
+        }
+        return written;
+    }
+
+    public SettableFuture<Boolean> logMasterMode() {
+        SettableFuture<Boolean> written = null;
+        if (m_replayComplete) {
+            long faultSpHandle = advanceTxnEgo().getTxnId();
+            Set<Long> master = Sets.newHashSet();
+            master.add(m_mailbox.getHSId());
+            written = m_cl.logIv2Fault(m_mailbox.getHSId(),
+                    master, m_partitionId, faultSpHandle, LogEntryType.MASTERMODE);
+            if (tmLog.isDebugEnabled()) {
+                tmLog.debug("Log master only mode on site " + CoreUtils.hsIdToString(m_mailbox.getHSId()) + " partition:" + m_partitionId);
+            }
         }
         return written;
     }
@@ -1822,5 +1919,26 @@ public class SpScheduler extends Scheduler implements SnapshotCompletionInterest
 
         // flush all RO transactions out of backlog
         m_pendingTasks.removeMPReadTransactions();
+    }
+
+    public ServiceState getServiceState() {
+        return m_serviceState;
+    }
+
+    public void setServiceState(ServiceState serviceState) {
+        m_serviceState = serviceState;
+    }
+
+    @Override
+    public void cleanupTransactionBacklogs() {
+        if (m_serviceState.isRemoved()) {
+            if (tmLog.isDebugEnabled()) {
+                tmLog.debug("Clean up transaction backlogs");
+            }
+            m_duplicateCounters.clear();
+            m_outstandingTxns.clear();
+            m_pendingTasks.m_taskQueue.clear();
+            m_repairLog.clear();
+        }
     }
 }

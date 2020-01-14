@@ -177,6 +177,9 @@ public class Benchmark {
         @Option(desc = "File with SSL properties")
         String sslfile = "";
 
+        @Option(desc = "Enable Hashmismatch generation")
+        boolean enablehashmismatchgen = false;
+
 
         @Override
         public void validate() {
@@ -510,19 +513,47 @@ public class Benchmark {
 
         if (cr.getStatus() != ClientResponse.SUCCESS) {
             log.error("Failed to call Statistics proc at startup. Exiting.");
-            log.error(((ClientResponseImpl) cr).toJSONString());
             printJStack();
-            System.exit(-1);
+            hardStop(((ClientResponseImpl) cr).toJSONString());
         }
 
         VoltTable t = cr.getResults()[0];
         partitionCount = (int) t.fetchRow(0).getLong(3);
         log.info("unique partition count is " + partitionCount);
         if (partitionCount <= 0) {
-            log.error("partition count is zero");
-            System.exit(-1);
+            hardStop("partition count is zero");
         }
         return partitionCount;
+    }
+
+    private void reportTaskStats() {
+        ClientResponse cr = null;
+        try {
+           cr = client.callProcedure("@Statistics", "TASK", 0);
+        } catch (Exception e) {
+            log.error("Fetching TASK statistics failed:", e);
+        }
+
+        if (cr.getStatus() != ClientResponse.SUCCESS) {
+            log.error("Failed to call Statistics proc at startup. Exiting.");
+            printJStack();
+            hardStop(((ClientResponseImpl) cr).toJSONString());
+        }
+        // try {
+        long failures = 0;
+        VoltTable t = cr.getResults()[0];
+        log.info(String.format("%15s%15s%15s%15s",
+                "TASK NAME", "PARTITION ID", "INVOCATIONS", "FAILURES"));
+        while (t.advanceRow()) {
+            long f = t.getLong("PROCEDURE_FAILURES");
+            log.info(String.format("%15s%15s%15s%15s",
+                    t.getString("TASK_NAME"), t.getLong("PARTITION_ID"), t.getLong("SCHEDULER_INVOCATIONS"), f));
+            if (f > 0)
+                failures += f;
+        }
+        if (failures > 0) {
+            hardStop(failures + " unexpected TASK failures");
+        }
     }
 
     private byte reportDeadThread(Thread th) {
@@ -538,9 +569,8 @@ public class Benchmark {
     public static Thread.UncaughtExceptionHandler h = new UncaughtExceptionHandler() {
         @Override
         public void uncaughtException(Thread th, Throwable ex) {
-        log.error("Uncaught exception: " + ex.getMessage(), ex);
         printJStack();
-        System.exit(-1);
+        log.error("Uncaught exception: " + ex.getMessage(), ex);
         }
     };
 
@@ -591,25 +621,25 @@ public class Benchmark {
         connect();
 
         // get partition count
-        int partitionCount = 0;
+        int pcount = 0;
         int trycount = 12;
         while (trycount-- > 0) {
             try {
-                partitionCount = getUniquePartitionCount();
+                pcount = getUniquePartitionCount();
                 break;
             } catch (Exception e) {
             }
             Thread.sleep(10000);
         }
+        final int partitionCount = pcount;
 
         // get stats
         try {
             ClientResponse cr = TxnId2Utils.doProcCall(client, "Summarize_Replica", config.threadoffset, config.threads);
             if (cr.getStatus() != ClientResponse.SUCCESS) {
                 log.error("Failed to call Summarize proc at startup. Exiting.");
-                log.error(((ClientResponseImpl) cr).toJSONString());
                 printJStack();
-                System.exit(-1);
+                hardStop(((ClientResponseImpl) cr).toJSONString());
             }
 
             // successfully called summarize
@@ -622,9 +652,8 @@ public class Benchmark {
             log.info("UPDATES RUN AGAINST THIS DB TO DATE: " + count);
         } catch (ProcCallException e) {
             log.error("Failed to call Summarize proc at startup. Exiting.", e);
-            log.error(((ClientResponseImpl) e.getClientResponse()).toJSONString());
             printJStack();
-            System.exit(-1);
+            hardStop(((ClientResponseImpl) e.getClientResponse()).toJSONString());
         }
 
         clientThreads = new ArrayList<ClientThread>();
@@ -790,6 +819,53 @@ public class Benchmark {
             updcls.start();
         }
 
+        if (config.enablehashmismatchgen) {
+            log.info("Hashmismatch will fire in " + String.valueOf(config.duration/2) + " seconds");
+            Thread hashmismatchthread = new Thread() {
+
+                public void run() {
+                    try {
+                        // run once halfway through .
+                        Thread.sleep((config.duration/2) * 1000);
+                    } catch(InterruptedException e) {
+                        return;
+                    }
+
+                    // same formula used in BigTableLoader.java
+                    Random r = new Random(0);
+                    long p = Math.abs((long)(r.nextGaussian() * partitionCount-1));
+                    boolean success = false;
+                    while ( ! success) {
+                      try {
+
+                        ClientResponse clientResponse = client.callProcedure("GenHashMismatchOnBigP", p);
+
+                        byte status = clientResponse.getStatus();
+                        if (status == ClientResponse.GRACEFUL_FAILURE ||
+                            status == ClientResponse.USER_ABORT) {
+                            hardStop("GenHashMismatchOnBigP gracefully failed to insert into BigP and this shouldn't happen. Exiting.");
+                        }
+                        if (status != ClientResponse.SUCCESS) {
+                            log.warn("GenHashMismatchOnBigP ungracefully failed to insert into BigP");
+                            log.warn(((ClientResponseImpl) clientResponse).toJSONString());
+                        } else {
+                            success = true;
+                            log.info("GenHashMismatchOnBigP executed successfully");
+                        }
+                     } catch (IOException | ProcCallException e) {
+                        log.warn("GenHashMismatchOnBigP ungracefully failed to insert into BigP. IOException:"+e.getMessage());
+                     } catch (Exception e) {
+                        hardStop("Unexpected exception with generating hashmismatch:" + e.getMessage());
+                        break;
+                     }
+                    success = true;
+                  }
+                }
+            };
+
+            hashmismatchthread.start();
+        }
+
 
         log.info("All threads started...");
 
@@ -880,6 +956,13 @@ public class Benchmark {
                 }
                 */
                 // cancel periodic stats printing
+
+                /** **/
+                log.info("\n+++ Calling reportTaskStats\n");
+                if (replTasklt != null || partTasklt != null) {
+                    reportTaskStats();
+                }
+
                 timer.cancel();
                 checkpointTimer.cancel();
                 /*

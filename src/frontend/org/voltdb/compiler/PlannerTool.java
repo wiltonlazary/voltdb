@@ -267,7 +267,7 @@ public class PlannerTool {
         }
 
         // Transform RIGHT Outer joins to LEFT ones
-        transformed = VoltPlanner.transformHep(Phase.OUTER_JOIN, transformed);
+        transformed = VoltPlanner.transformHep(Phase.LOGICAL_JOIN, transformed);
 
         // Prepare the set of RelTraits required of the root node at the termination of the physical conversion phase.
         // RelDistributions.ANY can satisfy any other types of RelDistributions.
@@ -277,7 +277,7 @@ public class PlannerTool {
                 .replace(RelDistributions.ANY);
 
         // Apply physical conversion rules.
-        Phase physicalPhase = (canCommuteJoins) ?
+        final Phase physicalPhase = canCommuteJoins ?
                 Phase.PHYSICAL_CONVERSION_WITH_JOIN_COMMUTE : Phase.PHYSICAL_CONVERSION;
         transformed = planner.transform(physicalPhase.ordinal(), requiredPhysicalOutputTraits, transformed);
 
@@ -293,7 +293,7 @@ public class PlannerTool {
             // Renumber the plan node ids to start with 1
             compiledPlan.resetPlanNodeIds(1);
         } catch (Exception e){
-            throw new PlannerFallbackException(e.getMessage());
+            throw new PlannerFallbackException(e);
         }
         planner.close();
         fragmentizePlan(compiledPlan);

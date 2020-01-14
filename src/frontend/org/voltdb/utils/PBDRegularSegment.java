@@ -343,7 +343,7 @@ class PBDRegularSegment<M> extends PBDSegment<M> {
         // Zero entry count means the segment is empty or corrupted, in both cases
         // the segment can be deleted.
         if (initialEntryCount == 0) {
-            reader.close();
+            reader.close(false);
             close();
             return Integer.MAX_VALUE;
         }
@@ -403,7 +403,7 @@ class PBDRegularSegment<M> extends PBDSegment<M> {
             }
         }
         int entriesScanned = reader.readIndex();
-        reader.close();
+        reader.close(false);
 
         if (entriesTruncated == 0) {
             int entriesNotScanned = initialEntryCount - entriesScanned;
@@ -450,7 +450,7 @@ class PBDRegularSegment<M> extends PBDSegment<M> {
 
             return entriesTruncated;
         } finally {
-            reader.purge();
+            reader.close();
         }
     }
 
@@ -466,7 +466,7 @@ class PBDRegularSegment<M> extends PBDSegment<M> {
             }
             return 0;
         } finally {
-            reader.purge();
+            reader.close();
         }
     }
 
@@ -866,6 +866,11 @@ class PBDRegularSegment<M> extends PBDSegment<M> {
         }
 
         @Override
+        public boolean allReadAndDiscarded() {
+            return m_discardCount == m_numOfEntries;
+        }
+
+        @Override
         public DBBPool.BBContainer poll(OutputContainerFactory factory) throws IOException {
             return poll(factory, false, false);
         }
@@ -1076,12 +1081,12 @@ class PBDRegularSegment<M> extends PBDSegment<M> {
 
         @Override
         public void close() throws IOException {
-            close(true);
+            close(false);
         }
 
         @Override
-        public void purge() throws IOException {
-            close(false);
+        public void closeAndSaveReaderState() throws IOException {
+            close(true);
         }
 
         private void close(boolean keep) throws IOException {
@@ -1089,6 +1094,8 @@ class PBDRegularSegment<M> extends PBDSegment<M> {
             m_readCursors.remove(m_cursorId);
             if (keep) {
                 m_closedCursors.put(m_cursorId, this);
+            } else { // if this was already closed, remove it for good
+                m_closedCursors.remove(m_cursorId);
             }
             if (m_readCursors.isEmpty() && !m_isActive) {
                 closeReadersAndFile();

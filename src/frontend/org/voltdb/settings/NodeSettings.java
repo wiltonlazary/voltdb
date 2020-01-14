@@ -47,10 +47,12 @@ public interface NodeSettings extends Settings {
     public final static String CL_PATH_KEY = "org.voltdb.path.command_log";
     public final static String SNAPTHOT_PATH_KEY = "org.voltdb.path.snapshots";
     public final static String VOLTDBROOT_PATH_KEY = "org.voltdb.path.voltdbroot";
+    public final static String EXPORT_CURSOR_PATH_KEY = "org.voltdb.path.export_cursor";
     public final static String EXPORT_OVERFLOW_PATH_KEY = "org.voltdb.path.export_overflow";
     public final static String DR_OVERFLOW_PATH_KEY = "org.voltdb.path.dr_overflow";
     public final static String LARGE_QUERY_SWAP_PATH_KEY = "org.voltdb.path.large_query_swap";
     public final static String LOCAL_SITES_COUNT_KEY = "org.voltdb.local_sites_count";
+    public final static String LOCAL_ACTIVE_SITES_COUNT_KEY = "org.voltdb.local_active_sites_count";
 
     @Key(VOLTDBROOT_PATH_KEY)
     public VoltFile getVoltDBRoot();
@@ -67,6 +69,9 @@ public interface NodeSettings extends Settings {
     @Key(EXPORT_OVERFLOW_PATH_KEY)
     public File getExportOverflow();
 
+    @Key(EXPORT_CURSOR_PATH_KEY)
+    public File getExportCursor();
+
     @Key(DR_OVERFLOW_PATH_KEY)
     public File getDROverflow();
 
@@ -77,6 +82,10 @@ public interface NodeSettings extends Settings {
     @Key(LOCAL_SITES_COUNT_KEY)
     @DefaultValue("8")
     public int getLocalSitesCount();
+
+    @Key(LOCAL_ACTIVE_SITES_COUNT_KEY)
+    @DefaultValue("8")
+    public int getLocalActiveSitesCount();
 
     public static NodeSettings create(Map<?, ?>...imports) {
         return ConfigFactory.create(NodeSettings.class, imports);
@@ -106,6 +115,7 @@ public interface NodeSettings extends Settings {
                 .put(EXPORT_OVERFLOW_PATH_KEY, resolve(getExportOverflow()))
                 .put(DR_OVERFLOW_PATH_KEY, resolve(getDROverflow()))
                 .put(LARGE_QUERY_SWAP_PATH_KEY, resolve(getLargeQuerySwap()))
+                .put(EXPORT_CURSOR_PATH_KEY, resolve(getExportCursor()))
                 .build();
     }
 
@@ -224,6 +234,7 @@ public interface NodeSettings extends Settings {
                 }
             }
             mb.put(LOCAL_SITES_COUNT_KEY, Integer.toString(getLocalSitesCount()));
+            mb.put(LOCAL_ACTIVE_SITES_COUNT_KEY, Integer.toString(getLocalActiveSitesCount()));
         } catch (IOException e) {
             throw new SettingsException("failed to canonicalize" + this);
         }

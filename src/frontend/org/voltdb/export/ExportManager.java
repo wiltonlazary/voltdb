@@ -28,6 +28,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.voltcore.logging.Level;
@@ -55,6 +57,7 @@ import org.voltdb.utils.LogKeys;
 import org.voltdb.utils.VoltFile;
 
 import com.google_voltpatches.common.base.Preconditions;
+import com.google_voltpatches.common.collect.HashMultimap;
 
 /**
  * Bridges the connection to an OLAP system and the buffers passed
@@ -120,6 +123,12 @@ public class ExportManager implements ExportManagerInterface
     private boolean m_startPolling = false;
     private SimpleClientResponseAdapter m_adapter;
     private ClientInterface m_ci;
+
+    // Track the data sources being closed, and a lock allowing {@code canUpdateCatalog()}
+    // to wait for all closed sources.
+    private HashMultimap<String, Integer> m_dataSourcesClosing = HashMultimap.create();
+    private final Semaphore m_allowCatalogUpdate = new Semaphore(1);
+    private final long UPDATE_CORE_TIMEOUT_SECONDS = 30;
 
     @Override
     public ExportManagerInterface.ExportMode getExportMode() {
@@ -466,7 +475,7 @@ public class ExportManager implements ExportManagerInterface
     public void shutdown() {
         ExportGeneration generation = m_generation.getAndSet(null);
         if (generation != null) {
-            generation.close();
+            generation.shutdown();
         }
         ExportDataProcessor proc = m_processor.getAndSet(null);
         if (proc != null) {
@@ -556,6 +565,7 @@ public class ExportManager implements ExportManagerInterface
         }
     }
 
+    @Override
     public void updateDanglingExportStates(StreamStartAction action,
             Map<String, Map<Integer, ExportSnapshotTuple>> exportSequenceNumbers) {
         ExportGeneration generation = m_generation.get();
@@ -610,5 +620,72 @@ public class ExportManager implements ExportManagerInterface
     public void invokeMigrateRowsDelete(int partition, String tableName, long deletableTxnId,  ProcedureCallback cb) {
         m_ci.getDispatcher().getInternelAdapterNT().callProcedure(m_ci.getInternalUser(), true, TTLManager.NT_PROC_TIMEOUT, cb,
                 "@MigrateRowsDeleterNT", new Object[] {partition, tableName, deletableTxnId});
+    }
+
+    // Note: not synchronized as only needs to touch the semaphore and must not block {@code onClosedSource}
+    @Override
+    public void waitOnClosingSources() {
+        boolean locked = false;
+        try {
+            locked = m_allowCatalogUpdate.tryAcquire(UPDATE_CORE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            if (!locked && !m_dataSourcesClosing.isEmpty()) {
+                exportLog.warn("After " + UPDATE_CORE_TIMEOUT_SECONDS
+                        + " seconds, these export streams are still closing: "
+                        + m_dataSourcesClosing.keySet());
+            }
+        }
+        catch (Exception ex) {
+            if (!m_dataSourcesClosing.isEmpty()) {
+                exportLog.warn("Unable to wait: " + ex + ", these export streams are still closing: "
+                        + m_dataSourcesClosing.keySet());
+            }
+        }
+        finally {
+            if (locked) {
+                m_allowCatalogUpdate.release();
+            }
+        }
+    }
+
+    @Override
+    public void onDrainedSource(String tableName, int partition) {
+        // No-op: handled by {@code ExportGeneration}
+    }
+
+    @Override
+    public synchronized void onClosingSource(String tableName, int partition) {
+        if (m_dataSourcesClosing.isEmpty()) {
+            if (exportLog.isDebugEnabled()) {
+                exportLog.debug("Locking catalog updates");
+            }
+            m_allowCatalogUpdate.acquireUninterruptibly();
+        }
+        m_dataSourcesClosing.put(tableName, partition);
+    }
+
+    @Override
+    public synchronized void onClosedSource(String tableName, int partition) {
+        boolean removed = m_dataSourcesClosing.remove(tableName, partition);
+        if (exportLog.isDebugEnabled()) {
+            if (removed) {
+                exportLog.debug("Closed " + tableName + ", partition " + partition);
+            }
+            else {
+                exportLog.debug("Closed untracked " + tableName + ", partition " + partition + " (ok on shutdown)");
+            }
+        }
+        if (removed && m_dataSourcesClosing.isEmpty()) {
+            if (exportLog.isDebugEnabled()) {
+                exportLog.debug("Unlocking catalog updates");
+            }
+            m_allowCatalogUpdate.release();
+        }
+    }
+
+    @Override
+    public synchronized void releaseResources(List<Integer> removedPartitions) {
+        if (m_generation.get() != null) {
+            m_generation.get().closeDataSources(removedPartitions);
+         }
     }
 }

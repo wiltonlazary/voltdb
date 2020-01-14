@@ -26,6 +26,8 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 
+import com.google_voltpatches.common.collect.ImmutableList;
+import com.google_voltpatches.errorprone.annotations.Immutable;
 import org.json_voltpatches.JSONException;
 import org.json_voltpatches.JSONObject;
 import org.voltcore.logging.VoltLogger;
@@ -42,6 +44,7 @@ import org.voltdb.VoltTable;
 import org.voltdb.dtxn.TransactionState;
 import org.voltdb.exceptions.SerializableException;
 import org.voltdb.exceptions.TransactionRestartException;
+import org.voltdb.iv2.DuplicateCounter.HashResult;
 import org.voltdb.messaging.CompleteTransactionMessage;
 import org.voltdb.messaging.DummyTransactionTaskMessage;
 import org.voltdb.messaging.DumpMessage;
@@ -73,7 +76,8 @@ public class MpScheduler extends Scheduler
 
     private final List<Long> m_iv2Masters;
     private final Map<Integer, Long> m_partitionMasters;
-    private final List<Long> m_buddyHSIds;
+    // Todo: update buddyHSIds
+    private ImmutableList<Long> m_buddyHSIds;
     // Leader migrated from one site to another
     private final Map<Long, Long> m_leaderMigrationMap;
 
@@ -94,12 +98,20 @@ public class MpScheduler extends Scheduler
     {
         super(partitionId, taskQueue);
         m_pendingTasks = new MpTransactionTaskQueue(m_tasks);
-        m_buddyHSIds = buddyHSIds;
+        m_buddyHSIds = ImmutableList.<Long>builder().addAll(buddyHSIds).build();
         m_iv2Masters = new ArrayList<Long>();
         m_partitionMasters = Maps.newHashMap();
         m_uniqueIdGenerator = new UniqueIdGenerator(partitionId, 0);
         m_leaderId = leaderId;
         m_leaderMigrationMap = Maps.newHashMap();
+    }
+
+    // reset buddy Hsid list if local sites decommissioned
+    void updateBuddyHSIds(List<Long> buddyHSIds) {
+        m_buddyHSIds = ImmutableList.<Long>builder().addAll(buddyHSIds).build();
+        // We need at least one available sites on the MPI host
+        assert(m_buddyHSIds.size() > 0);
+        m_nextBuddy = 0;
     }
 
     void setMpRoSitePool(MpRoSitePool sitePool)
@@ -160,8 +172,8 @@ public class MpScheduler extends Scheduler
             List<Long> doneCounters = new LinkedList<Long>();
             for (Entry<Long, DuplicateCounter> entry : m_duplicateCounters.entrySet()) {
                 DuplicateCounter counter = entry.getValue();
-                int result = counter.updateReplicas(m_iv2Masters);
-                if (result == DuplicateCounter.DONE) {
+                HashResult result = counter.updateReplicas(m_iv2Masters);
+                if (result.isDone()) {
                     doneCounters.add(entry.getKey());
                 }
             }
@@ -324,7 +336,8 @@ public class MpScheduler extends Scheduler
                     message.getInitiatorHSId(),
                     mpTxnId,
                     m_iv2Masters,
-                    message);
+                    message,
+                    localId);
             safeAddToDuplicateCounterMap(mpTxnId, counter);
             EveryPartitionTask eptask =
                 new EveryPartitionTask(m_mailbox, m_pendingTasks, sp,
@@ -511,19 +524,31 @@ public class MpScheduler extends Scheduler
             return;
         }
         if (counter != null) {
-            int result = counter.offer(message);
-            if (result == DuplicateCounter.DONE) {
+            HashResult result = counter.offer(message);
+            if (result.isDone()) {
                 m_duplicateCounters.remove(message.getTxnId());
                 advanceRepairTruncationHandle(message);
                 m_outstandingTxns.remove(message.getTxnId());
                 m_mailbox.send(counter.m_destinationId, message);
-            } else if (result == DuplicateCounter.MISMATCH || result == DuplicateCounter.ABORT) {
+            } else if (result.isAbort() || result.isMismatch()) {
                 VoltDB.crashLocalVoltDB("HASH MISMATCH running every-site system procedure.", true, null);
             }
         } else {
             advanceRepairTruncationHandle(message);
             MpTransactionState txn = (MpTransactionState)m_outstandingTxns.remove(message.getTxnId());
-            assert(txn != null);
+            if (txn == null) {
+                // The thread (updateReplicas) could wipe out duplicate counters for run-everywhere system procedures
+                // if the duplicate counters contain only the partition masters from failed hosts.
+                // If a response from a failed partition master get here after the transaction has been declared completed, ignore it.
+                final Set<Integer> liveHosts = VoltDB.instance().getHostMessenger().getLiveHostIds();
+                if (liveHosts.contains(CoreUtils.getHostIdFromHSId(message.m_sourceHSId))) {
+                    // This should not happen
+                    tmLog.warn("Received InitiateResponseMessage after the transaction is completed from " + CoreUtils.hsIdToString(message.m_sourceHSId));
+                    assert(false);
+                }
+                // Message is from a dead host
+                return;
+            }
             // the initiatorHSId is the ClientInterface mailbox. Yeah. I know.
             m_mailbox.send(message.getInitiatorHSId(), message);
             // We actually completed this MP transaction.  Create a fake CompleteTransactionMessage

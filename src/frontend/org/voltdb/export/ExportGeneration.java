@@ -54,6 +54,7 @@ import org.voltcore.utils.RateLimitedLogger;
 import org.voltcore.zk.ZKUtil;
 import org.voltdb.CatalogContext;
 import org.voltdb.ExportStatsBase.ExportStatsRow;
+import org.voltdb.RealVoltDB;
 import org.voltdb.SnapshotCompletionMonitor.ExportSnapshotTuple;
 import org.voltdb.TableType;
 import org.voltdb.VoltDB;
@@ -762,18 +763,11 @@ public class ExportGeneration implements Generation {
             }
         }
 
-        //Do closings outside the synchronized block and wait for completion.
-        List<ListenableFuture<?>> tasks = new ArrayList<ListenableFuture<?>>();
+        //Do closings outside the synchronized block
         for (ExportDataSource source : doneSources) {
             exportLog.info("Finished processing " + source);
-            tasks.add(source.closeAndDelete());
-        }
-        try {
-            Futures.allAsList(tasks).get();
-        } catch (Exception e) {
-            //Logging of errors  is done inside the tasks so nothing to do here
-            //intentionally not failing if there is an issue with close
-            exportLog.error("Error deleting export data sources", e);
+            ExportManagerInterface.instance().onClosingSource(source.getTableName(), source.getPartitionId());
+            source.closeAndDelete();
         }
     }
 
@@ -810,9 +804,10 @@ public class ExportGeneration implements Generation {
             }
         }
 
-        //Do closing outside the synchronized block. Do not wait on future since
-        // we're invoked from the source's executor thread.
+        //Do closing outside the synchronized block.
+        ExportManagerInterface.instance().onClosingSource(tableName, partitionId);
         source.closeAndDelete();
+
     }
 
 
@@ -824,8 +819,11 @@ public class ExportGeneration implements Generation {
         Map<String, ExportDataSource> sources = m_dataSourcesByPartition.get(partitionId);
 
         if (sources == null) {
-            exportLog.error("PUSH Could not find export data sources for partition "
-                    + partitionId + ". The export data is being discarded.");
+            RealVoltDB db = (RealVoltDB)VoltDB.instance();
+            if (!db.isPartitionDecommissioned(partitionId)) {
+                exportLog.error("PUSH Could not find export data sources for partition "
+                        + partitionId + ". The export data is being discarded.");
+            }
             if (buffer != null) {
                 DBBPool.wrapBB(buffer).discard();
             }
@@ -974,21 +972,20 @@ public class ExportGeneration implements Generation {
     }
 
     @Override
-    public void close() {
+    public void shutdown() {
         List<ListenableFuture<?>> tasks = new ArrayList<ListenableFuture<?>>();
         synchronized(m_dataSourcesByPartition) {
             for (Map<String, ExportDataSource> sources : m_dataSourcesByPartition.values()) {
                 for (ExportDataSource source : sources.values()) {
-                    tasks.add(source.close());
+                    tasks.add(source.shutdown());
                 }
             }
         }
         try {
-            Futures.allAsList(tasks).get();
+            if (!tasks.isEmpty())
+                Futures.allAsList(tasks).get();
         } catch (Exception e) {
-            //Logging of errors  is done inside the tasks so nothing to do here
-            //intentionally not failing if there is an issue with close
-            exportLog.error("Error closing export data sources", e);
+            exportLog.error("Unexpected exception shutting down export data.", e);
         }
         //Do this before so no watchers gets created.
         m_shutdown = true;
@@ -1059,6 +1056,24 @@ public class ExportGeneration implements Generation {
                         results.addRow(source.getTableName(), source.getTarget(), partition, "SUCCESS", "");
                     }
                 }
+            }
+        }
+    }
+
+    public void closeDataSources(List<Integer> removedPartitions) {
+        synchronized (m_dataSourcesByPartition) {
+            for (Map.Entry<Integer, Map<String, ExportDataSource>> dataSources : m_dataSourcesByPartition.entrySet()) {
+                Integer partition = dataSources.getKey();
+                if (removedPartitions.contains(partition)) {
+                    for (ExportDataSource source : dataSources.getValue().values()) {
+                        source.closeAndDelete();
+                    }
+                }
+            }
+            m_dataSourcesByPartition.keySet().removeAll(removedPartitions);
+            removedPartitions.stream().forEach(p -> removeMailbox(p));
+            if (exportLog.isDebugEnabled()) {
+                exportLog.info("Remaining datasources:" + m_dataSourcesByPartition);
             }
         }
     }
